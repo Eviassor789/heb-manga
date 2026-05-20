@@ -1,0 +1,30 @@
+# ── Web server ─────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+
+# ── File handling ───────────────────────────────────────────────────────────
+pypdf>=4.2.0           # PDF manipulation (metadata, page count)
+PyMuPDF>=1.24.0        # PDF → image rendering (no poppler binary needed)
+Pillow>=10.3.0         # Image I/O and typesetting
+img2pdf>=0.5.1         # Lossless PNG → PDF assembly
+
+# ── OCR & detection ─────────────────────────────────────────────────────────
+easyocr>=1.7.1         # English text extraction from comic panels
+
+# ── Inpainting ──────────────────────────────────────────────────────────────
+torch>=2.3.0           # Required by EasyOCR and LaMa
+torchvision>=0.18.0
+opencv-python>=4.9.0
+omegaconf>=2.3.0       # LaMa config system
+
+# ── Hebrew typesetting ──────────────────────────────────────────────────────
+python-bidi>=0.4.2     # Unicode BiDi algorithm — REQUIRED for correct Hebrew rendering
+arabic-reshaper>=3.0.0 # Handles mixed RTL/LTR edge cases
+
+# ── Translation ─────────────────────────────────────────────────────────────
+google-generativeai>=0.7.0
+
+# ── comic-text-detector: install manually (not on PyPI) ─────────────────────
+# git clone https://github.com/dmMaze/comic-text-detector
+# pip install -e ./comic-text-detector
