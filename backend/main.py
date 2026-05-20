@@ -5,12 +5,18 @@ import shutil
 import uuid
 from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel
 
-from pipeline import splitter
+# Load backend/.env before any module reads os.getenv()
+load_dotenv()
+
+from pipeline import detector, inpainter, ocr, splitter, translator, typesetter
 from utils.job_manager import JobManager
+from utils.manga_downloader import download_chapter
 
 app = FastAPI(title="Hebrew Manga Translator API", version="0.1.0")
 
@@ -32,6 +38,15 @@ job_manager = JobManager()
 
 
 # ---------------------------------------------------------------------------
+# Request bodies
+# ---------------------------------------------------------------------------
+
+class FetchChapterBody(BaseModel):
+    url:        str
+    data_saver: bool = False
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -43,6 +58,15 @@ def _require_job(job_id: str) -> Path:
     job_dir = _job_dir(job_id)
     if not job_dir.exists():
         raise HTTPException(status_code=404, detail="Job not found.")
+    return job_dir
+
+
+def _create_job_dirs(job_id: str) -> Path:
+    """Create and return the job directory with all required subdirectories."""
+    job_dir = _job_dir(job_id)
+    job_dir.mkdir(parents=True)
+    for sub in ("original", "detection", "cleaned", "translated", "output"):
+        (job_dir / sub).mkdir()
     return job_dir
 
 
@@ -67,17 +91,35 @@ async def create_job(file: UploadFile = File(...)):
             detail=f"File exceeds {MAX_FILE_SIZE_MB} MB limit.",
         )
 
-    job_id = str(uuid.uuid4())
-    job_dir = _job_dir(job_id)
-    job_dir.mkdir(parents=True)
-    for sub in ("original", "detection", "cleaned", "translated", "output"):
-        (job_dir / sub).mkdir()
+    job_id  = str(uuid.uuid4())
+    job_dir = _create_job_dirs(job_id)
 
     upload_path = job_dir / f"source{suffix}"
     upload_path.write_bytes(content)
 
     job_manager.register_job(job_id)
     asyncio.create_task(_run_pipeline(job_id, upload_path))
+
+    return {"job_id": job_id}
+
+
+@app.post("/api/jobs/from-url", status_code=201)
+async def create_job_from_url(body: FetchChapterBody):
+    """
+    Download a MangaDex chapter by URL or UUID, then run the translation pipeline.
+
+    Body JSON:
+      { "url": "https://mangadex.org/chapter/<uuid>", "data_saver": false }
+
+    data_saver: set true for lower-resolution images (faster download, smaller file).
+    """
+    job_id  = str(uuid.uuid4())
+    job_dir = _create_job_dirs(job_id)
+
+    job_manager.register_job(job_id)
+    asyncio.create_task(
+        _run_pipeline_from_url(job_id, job_dir, body.url, body.data_saver)
+    )
 
     return {"job_id": job_id}
 
@@ -117,25 +159,76 @@ async def delete_job(job_id: str):
 
 
 # ---------------------------------------------------------------------------
-# Pipeline runner (grows as each module is implemented)
+# Shared pipeline steps (Steps 1-5 + done emit)
+# ---------------------------------------------------------------------------
+
+async def _run_pipeline_steps(
+    job_id:  str,
+    job_dir: Path,
+    pages:   list[Path],
+    emit,
+) -> None:
+    """
+    Run Steps 1-5 of the pipeline and emit the final 'done' event.
+
+    Called by both _run_pipeline (file upload) and _run_pipeline_from_url
+    (MangaDex download) after pages are already in original/.
+    """
+    # ── Step 1: Detect ─────────────────────────────────────────────────────
+    pages = await detector.detect(job_dir, pages, emit)
+
+    # ── Step 2: OCR ────────────────────────────────────────────────────────
+    pages = await ocr.ocr(job_dir, pages, emit)
+
+    # ── Step 3: Inpaint ────────────────────────────────────────────────────
+    pages = await inpainter.inpaint(job_dir, pages, emit)
+
+    # ── Step 4: Translate ──────────────────────────────────────────────────
+    pages = await translator.translate(job_dir, pages, emit)
+
+    # ── Step 5: Typeset ────────────────────────────────────────────────────
+    pages = await typesetter.typeset(job_dir, pages, emit)
+
+    await emit({
+        "stage":        "done",
+        "total_pages":  len(pages),
+        "download_url": f"/api/jobs/{job_id}/download",
+    })
+
+
+# ---------------------------------------------------------------------------
+# Pipeline runners
 # ---------------------------------------------------------------------------
 
 async def _run_pipeline(job_id: str, source_file: Path) -> None:
-    emit = job_manager.get_emitter(job_id)
+    """Pipeline runner for file-upload jobs (PDF / ZIP source)."""
+    emit    = job_manager.get_emitter(job_id)
     job_dir = _job_dir(job_id)
 
     try:
         # ── Step 0: Split ──────────────────────────────────────────────────
         pages = await splitter.split(job_dir, source_file, emit)
 
-        # ── Steps 1-4: placeholders (implemented in future sessions) ───────
-        # Each step will import its module and call it here, e.g.:
-        #   await detector.detect(job_dir, pages, emit)
-        #   await inpainter.inpaint(job_dir, pages, emit)
-        #   await translator.translate(job_dir, pages, emit)
-        #   await typesetter.typeset(job_dir, pages, emit)
+        await _run_pipeline_steps(job_id, job_dir, pages, emit)
 
-        await emit({"stage": "done", "total_pages": len(pages), "download_url": f"/api/jobs/{job_id}/download"})
+    except Exception as exc:
+        await emit({"stage": "error", "message": str(exc)})
+
+
+async def _run_pipeline_from_url(
+    job_id:     str,
+    job_dir:    Path,
+    url:        str,
+    data_saver: bool,
+) -> None:
+    """Pipeline runner for MangaDex URL jobs."""
+    emit = job_manager.get_emitter(job_id)
+
+    try:
+        # ── Step 0: Download ───────────────────────────────────────────────
+        pages = await download_chapter(url, job_dir, emit, data_saver=data_saver)
+
+        await _run_pipeline_steps(job_id, job_dir, pages, emit)
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})

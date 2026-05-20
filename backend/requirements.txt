@@ -2,28 +2,36 @@
 fastapi>=0.111.0
 uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
+python-dotenv>=1.0.0     # loads backend/.env so GEMINI_API_KEY is available
 
 # ── File handling ───────────────────────────────────────────────────────────
 pypdf>=4.2.0           # PDF manipulation (metadata, page count)
 PyMuPDF>=1.24.0        # PDF → image rendering (no poppler binary needed)
-Pillow>=10.3.0         # Image I/O and typesetting
+Pillow>=9.5.0          # Image I/O and typesetting
 img2pdf>=0.5.1         # Lossless PNG → PDF assembly
 
 # ── OCR & detection ─────────────────────────────────────────────────────────
 easyocr>=1.7.1         # English text extraction from comic panels
 
 # ── Inpainting ──────────────────────────────────────────────────────────────
-torch>=2.3.0           # Required by EasyOCR and LaMa
+# NOTE: simple-lama-inpainting declares numpy<2 and Pillow<10 in its metadata,
+# but the actual code is compatible with numpy 2.x and Pillow 10+. Install
+# order: install easyocr first (pulls numpy 2.x), then simple-lama-inpainting.
+# pip will warn about the conflict but both packages work correctly at runtime.
+simple-lama-inpainting # LaMa inpainting — auto-downloads model on first use
+torch>=2.3.0           # Required by EasyOCR and simple-lama-inpainting
 torchvision>=0.18.0
-opencv-python>=4.9.0
-omegaconf>=2.3.0       # LaMa config system
+opencv-python>=4.9.0   # Also used as inpainting fallback (cv2.inpaint)
 
 # ── Hebrew typesetting ──────────────────────────────────────────────────────
 python-bidi>=0.4.2     # Unicode BiDi algorithm — REQUIRED for correct Hebrew rendering
 arabic-reshaper>=3.0.0 # Handles mixed RTL/LTR edge cases
 
+# ── HTTP client (MangaDex downloader) ───────────────────────────────────────
+httpx>=0.27.0                # async HTTP client used by manga_downloader.py
+
 # ── Translation ─────────────────────────────────────────────────────────────
-google-generativeai>=0.7.0
+google-generativeai>=0.8.0   # 0.8+ needed for gemini-2.0-flash + JSON mime type
 
 # ── comic-text-detector: install manually (not on PyPI) ─────────────────────
 # git clone https://github.com/dmMaze/comic-text-detector
