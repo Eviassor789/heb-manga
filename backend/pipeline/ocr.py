@@ -36,7 +36,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from utils.job_manager import EmitFn
+from core.job_manager import EmitFn
 
 # ---------------------------------------------------------------------------
 # Config

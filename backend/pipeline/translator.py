@@ -16,12 +16,14 @@ glossary.json starts empty and grows as Gemini identifies proper nouns
 page's user message so translations stay consistent across the whole file.
 
 Free-tier limits: 15 RPM · 1 M TPM · 1 500 RPD
-Rate limiting is handled by utils/rate_limiter.py (exponential backoff).
+Rate limiting is handled by core/rate_limiter.py (exponential backoff).
 
 Required environment variable:
   GEMINI_API_KEY     — get one free at https://aistudio.google.com/
 Optional:
   GEMINI_MODEL       — default: gemini-2.0-flash
+
+SDK: google-genai (new SDK — replaces deprecated google-generativeai)
 """
 
 from __future__ import annotations
@@ -33,8 +35,8 @@ import os
 import re
 from pathlib import Path
 
-from utils.job_manager import EmitFn
-from utils.rate_limiter import call_with_backoff
+from core.job_manager import EmitFn
+from core.rate_limiter import call_with_backoff
 
 log = logging.getLogger(__name__)
 
@@ -42,7 +44,7 @@ log = logging.getLogger(__name__)
 # Gemini config
 # ---------------------------------------------------------------------------
 
-_DEFAULT_MODEL = "gemini-2.0-flash"
+_DEFAULT_MODEL = "gemini-2.5-flash"
 _TEMPERATURE   = 0.3   # lower = more deterministic, consistent tone
 
 _SYSTEM_INSTRUCTION = """\
@@ -84,24 +86,24 @@ nickname) you encountered, whether it was already in the glossary or new.\
 """
 
 # ---------------------------------------------------------------------------
-# Lazy model singleton (created once, reused for all pages)
+# Lazy client singleton (created once, reused for all pages)
 # ---------------------------------------------------------------------------
 
-_model = None
+_client = None
 
 
-async def _get_model():
-    """Return cached GenerativeModel, creating it on first call."""
-    global _model
-    if _model is None:
+async def _get_client():
+    """Return cached genai.Client, creating it on first call."""
+    global _client
+    if _client is None:
         loop = asyncio.get_running_loop()
-        _model = await loop.run_in_executor(None, _create_model)
-    return _model
+        _client = await loop.run_in_executor(None, _create_client)
+    return _client
 
 
-def _create_model():
-    """Synchronous model creation — runs in thread executor."""
-    import google.generativeai as genai  # noqa: PLC0415
+def _create_client():
+    """Synchronous client creation — runs in thread executor."""
+    from google import genai  # noqa: PLC0415
 
     api_key = os.getenv("GEMINI_API_KEY", "").strip()
     if not api_key:
@@ -112,18 +114,7 @@ def _create_model():
             "  3. Restart the server."
         )
 
-    genai.configure(api_key=api_key)
-
-    return genai.GenerativeModel(
-        model_name=os.getenv("GEMINI_MODEL", _DEFAULT_MODEL),
-        system_instruction=_SYSTEM_INSTRUCTION,
-        generation_config=genai.GenerationConfig(
-            temperature=_TEMPERATURE,
-            # Forces the model to return raw JSON without markdown fences.
-            # We still strip fences defensively in _parse_response().
-            response_mime_type="application/json",
-        ),
-    )
+    return genai.Client(api_key=api_key)
 
 
 # ---------------------------------------------------------------------------
@@ -250,7 +241,10 @@ async def _translate_page(
     • the current glossary (so Gemini uses consistent name translations)
     • a JSON array of {id, source_text, type} objects to translate
     """
-    model = await _get_model()
+    from google.genai import types  # noqa: PLC0415
+
+    client = await _get_client()
+    model  = os.getenv("GEMINI_MODEL", _DEFAULT_MODEL).strip()
 
     glossary_block = (
         json.dumps(glossary, ensure_ascii=False, indent=2)
@@ -273,8 +267,18 @@ async def _translate_page(
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}"
     )
 
+    config = types.GenerateContentConfig(
+        system_instruction=_SYSTEM_INSTRUCTION,
+        temperature=_TEMPERATURE,
+        response_mime_type="application/json",
+    )
+
     response = await call_with_backoff(
-        lambda: model.generate_content_async(user_message)
+        lambda: client.aio.models.generate_content(
+            model=model,
+            contents=user_message,
+            config=config,
+        )
     )
 
     return _parse_response(response.text)

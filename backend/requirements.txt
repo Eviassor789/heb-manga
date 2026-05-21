@@ -31,7 +31,7 @@ arabic-reshaper>=3.0.0 # Handles mixed RTL/LTR edge cases
 httpx>=0.27.0                # async HTTP client used by manga_downloader.py
 
 # ── Translation ─────────────────────────────────────────────────────────────
-google-generativeai>=0.8.0   # 0.8+ needed for gemini-2.0-flash + JSON mime type
+google-genai>=2.5.0          # new official Gemini SDK (replaces deprecated google-generativeai)
 
 # ── comic-text-detector: install manually (not on PyPI) ─────────────────────
 # git clone https://github.com/dmMaze/comic-text-detector

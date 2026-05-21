@@ -32,7 +32,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from utils.job_manager import EmitFn
+from core.job_manager import EmitFn
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -129,14 +129,15 @@ def _detect_page(page_path: Path, detection_dir: Path) -> None:
         raise ValueError(f"cv2 could not read image: {page_path}")
     h, w = img_bgr.shape[:2]
 
-    blk_list, mask = detector.detect(img_bgr)
+    # TextDetector.__call__ returns (mask_raw, mask_refined, blk_list).
+    # mask_refined already has text-region contours cleaned up by the model;
+    # we use it as our base and apply a small dilation to ensure edge pixels
+    # are fully covered for LaMa inpainting.
+    mask_raw, mask_refined, blk_list = detector(img_bgr)
 
     # ── Mask ────────────────────────────────────────────────────────────────
-    # mask is a uint8 ndarray: 255 = text region, 0 = background.
-    # A small morphological dilation ensures stray pixels around letter edges
-    # are fully covered, which improves LaMa inpainting quality.
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_dilated = cv2.dilate(mask, kernel, iterations=2)
+    mask_dilated = cv2.dilate(mask_refined, kernel, iterations=2)
 
     mask_path = detection_dir / f"{page_path.stem}_mask.png"
     cv2.imwrite(str(mask_path), mask_dilated)
@@ -183,10 +184,8 @@ def _extract_bbox(blk) -> list[int] | None:
     Returns None for degenerate or missing boxes.
     """
     try:
-        arr = np.asarray(blk.xyxy).flatten()
-        if arr.size < 4:
-            return None
-        x1, y1, x2, y2 = (int(v) for v in arr[:4])
+        # blk.xyxy is [x1, y1, x2, y2] (list of ints set in TextBlock.__init__)
+        x1, y1, x2, y2 = (int(v) for v in blk.xyxy[:4])
         if x2 <= x1 or y2 <= y1:
             return None
         return [x1, y1, x2, y2]

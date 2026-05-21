@@ -18,7 +18,7 @@ from pathlib import Path
 import fitz  # PyMuPDF
 from PIL import Image
 
-from utils.job_manager import EmitFn
+from core.job_manager import EmitFn
 
 # Image formats we'll accept from a ZIP archive
 _IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tiff"}

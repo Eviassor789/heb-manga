@@ -1,7 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "Bash(gh release *)"
+      "Bash(gh release *)",
+      "Bash(.venv/Scripts/uvicorn main:app --host 0.0.0.0 --port 8000 --reload)",
+      "Bash(curl -s http://localhost:8000/docs)",
+      "Bash(.venv/Scripts/uvicorn main:app --host 0.0.0.0 --port 8000)",
+      "Bash(echo \"PID=$!\")",
+      "Bash(.venv/Scripts/pip show *)",
+      "Bash(.venv/Scripts/python -)"
     ]
   }
 }

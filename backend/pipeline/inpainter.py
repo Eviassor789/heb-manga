@@ -35,7 +35,7 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from utils.job_manager import EmitFn
+from core.job_manager import EmitFn
 
 # ---------------------------------------------------------------------------
 # Config

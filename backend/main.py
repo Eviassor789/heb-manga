@@ -12,11 +12,13 @@ from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 # Load backend/.env before any module reads os.getenv()
-load_dotenv()
+# override=True ensures a key change in .env takes effect on restart
+# even if GEMINI_API_KEY was already set in the shell environment.
+load_dotenv(override=True)
 
 from pipeline import detector, inpainter, ocr, splitter, translator, typesetter
-from utils.job_manager import JobManager
-from utils.manga_downloader import download_chapter
+from core.job_manager import JobManager
+from core.manga_downloader import download_chapter
 
 app = FastAPI(title="Hebrew Manga Translator API", version="0.1.0")
 
@@ -44,6 +46,12 @@ job_manager = JobManager()
 class FetchChapterBody(BaseModel):
     url:        str
     data_saver: bool = False
+
+
+_RESUME_STEPS = {"detect", "ocr", "inpaint", "translate", "typeset"}
+
+class ResumeBody(BaseModel):
+    from_step: str = "translate"   # one of: detect | ocr | inpaint | translate | typeset
 
 
 # ---------------------------------------------------------------------------
@@ -158,6 +166,46 @@ async def delete_job(job_id: str):
     job_manager.remove_job(job_id)
 
 
+@app.post("/api/jobs/{job_id}/resume", status_code=202)
+async def resume_job(job_id: str, body: ResumeBody):
+    """
+    Re-run the pipeline from a given step using already-computed artifacts.
+
+    Useful during development to iterate on translate/typeset without
+    re-running the slow detect/OCR/inpaint steps.
+
+    Body JSON:  { "from_step": "translate" }
+    Valid steps: detect | ocr | inpaint | translate | typeset
+
+    The job directory must already exist (i.e. the job was created previously).
+    Output from earlier steps on disk is reused as-is.
+    """
+    job_dir = _require_job(job_id)
+
+    if body.from_step not in _RESUME_STEPS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid from_step '{body.from_step}'. "
+                   f"Must be one of: {', '.join(sorted(_RESUME_STEPS))}",
+        )
+
+    pages = _load_existing_pages(job_dir)
+    if not pages:
+        raise HTTPException(
+            status_code=409,
+            detail="No pages found in original/. "
+                   "Run a full job first before resuming.",
+        )
+
+    # Re-register the job so SSE history is cleared and fresh events stream
+    job_manager.register_job(job_id)
+    asyncio.create_task(
+        _run_pipeline_from_step(job_id, job_dir, pages, body.from_step)
+    )
+
+    return {"job_id": job_id, "resuming_from": body.from_step}
+
+
 # ---------------------------------------------------------------------------
 # Shared pipeline steps (Steps 1-5 + done emit)
 # ---------------------------------------------------------------------------
@@ -229,6 +277,58 @@ async def _run_pipeline_from_url(
         pages = await download_chapter(url, job_dir, emit, data_saver=data_saver)
 
         await _run_pipeline_steps(job_id, job_dir, pages, emit)
+
+    except Exception as exc:
+        await emit({"stage": "error", "message": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Resume helpers
+# ---------------------------------------------------------------------------
+
+def _load_existing_pages(job_dir: Path) -> list[Path]:
+    """
+    Reconstruct the pages list from whatever PNGs are already in original/.
+    Returns them sorted by filename (001.png, 002.png, …).
+    """
+    return sorted(
+        p for p in (job_dir / "original").glob("*.png")
+        if p.stem.isdigit()
+    )
+
+
+async def _run_pipeline_from_step(
+    job_id:    str,
+    job_dir:   Path,
+    pages:     list[Path],
+    from_step: str,
+) -> None:
+    """
+    Run the pipeline starting at `from_step`, reusing earlier artifacts on disk.
+
+    Step order: detect → ocr → inpaint → translate → typeset
+    """
+    emit = job_manager.get_emitter(job_id)
+    _steps = ["detect", "ocr", "inpaint", "translate", "typeset"]
+    start  = _steps.index(from_step)
+
+    try:
+        if start <= 0:
+            pages = await detector.detect(job_dir, pages, emit)
+        if start <= 1:
+            pages = await ocr.ocr(job_dir, pages, emit)
+        if start <= 2:
+            pages = await inpainter.inpaint(job_dir, pages, emit)
+        if start <= 3:
+            pages = await translator.translate(job_dir, pages, emit)
+        if start <= 4:
+            pages = await typesetter.typeset(job_dir, pages, emit)
+
+        await emit({
+            "stage":        "done",
+            "total_pages":  len(pages),
+            "download_url": f"/api/jobs/{job_id}/download",
+        })
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})

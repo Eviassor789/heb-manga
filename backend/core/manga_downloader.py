@@ -34,7 +34,7 @@ from pathlib import Path
 
 import httpx
 
-from utils.job_manager import EmitFn
+from core.job_manager import EmitFn
 
 log = logging.getLogger(__name__)
 

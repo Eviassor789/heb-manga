@@ -44,7 +44,7 @@ import img2pdf
 from bidi.algorithm import get_display
 from PIL import Image, ImageDraw, ImageFont
 
-from utils.job_manager import EmitFn
+from core.job_manager import EmitFn
 
 log = logging.getLogger(__name__)
 
@@ -63,10 +63,41 @@ _PADDING       = 8     # pixels between text block and bbox edges
 _TEXT_COLOR = (0, 0, 0)   # solid black — speech bubbles have white/light bg
 
 # Heebo Bold: clean, legible at small sizes, OFL license
-_FONT_FILENAME    = "Heebo-Bold.ttf"
-_FONT_DOWNLOAD_URL = (
-    "https://github.com/google/fonts/raw/main/ofl/heebo/static/Heebo-Bold.ttf"
-)
+_FONT_FILENAME = "Heebo-Bold.ttf"
+
+# Multiple CDN mirrors tried in order — first success wins
+_FONT_DOWNLOAD_URLS = [
+    # raw.githubusercontent (most reliable for large files)
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/heebo/static/Heebo-Bold.ttf",
+    # github.com/raw redirect (sometimes works when above doesn't)
+    "https://github.com/google/fonts/raw/main/ofl/heebo/static/Heebo-Bold.ttf",
+    # Variable font — Pillow handles it fine, just picks weight 400
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/heebo/Heebo%5Bwght%5D.ttf",
+]
+
+# OS system fonts that support Hebrew — checked before attempting any download.
+# Priority: bold variants > regular (bolder looks better in speech bubbles).
+_SYSTEM_FONT_CANDIDATES: list[Path] = [
+    # ── Windows ──────────────────────────────────────────────────────
+    Path("C:/Windows/Fonts/davidbd.ttf"),       # David Bold   (Hebrew serif)
+    Path("C:/Windows/Fonts/david.ttf"),          # David        (Hebrew serif)
+    Path("C:/Windows/Fonts/miriambd.ttf"),       # Miriam Bold
+    Path("C:/Windows/Fonts/miriam.ttf"),         # Miriam
+    Path("C:/Windows/Fonts/arialbd.ttf"),        # Arial Bold   (Latin+Hebrew)
+    Path("C:/Windows/Fonts/arial.ttf"),          # Arial        (Latin+Hebrew)
+    # ── Linux ────────────────────────────────────────────────────────
+    Path("/usr/share/fonts/truetype/noto/NotoSansHebrew-Bold.ttf"),
+    Path("/usr/share/fonts/truetype/noto/NotoSansHebrew-Regular.ttf"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansHebrew-Regular.otf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
+    Path("/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"),
+    Path("/usr/share/fonts/truetype/freefont/FreeSansBold.ttf"),
+    # ── macOS ────────────────────────────────────────────────────────
+    Path("/Library/Fonts/Arial Bold.ttf"),
+    Path("/Library/Fonts/Arial.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+    Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+]
 
 _executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="typesetter")
 
@@ -81,7 +112,13 @@ def _resolve_font() -> Path:
     """
     Find or download the Hebrew TTF font, then cache the result.
 
-    Raises RuntimeError if no font can be found or downloaded.
+    Search order:
+      1. HEBREW_FONT_PATH environment variable
+      2. Any .ttf/.otf in backend/fonts/
+      3. OS system fonts that support Hebrew  (Windows David/Arial, Linux Noto/DejaVu, macOS Arial)
+      4. Auto-download Heebo-Bold.ttf — tries multiple CDN mirrors in sequence
+
+    Raises RuntimeError if every option fails.
     """
     global _resolved_font_path
 
@@ -104,23 +141,41 @@ def _resolve_font() -> Path:
         candidates = sorted(_FONTS_DIR.glob(pattern))
         if candidates:
             _resolved_font_path = candidates[0]
-            log.info("[typesetter] Using font: %s", _resolved_font_path.name)
+            log.info("[typesetter] Using font from fonts/: %s", _resolved_font_path.name)
             return _resolved_font_path
 
-    # 3. Auto-download Heebo-Bold.ttf
+    # 3. OS system fonts
+    for candidate in _SYSTEM_FONT_CANDIDATES:
+        if candidate.exists():
+            _resolved_font_path = candidate
+            log.info("[typesetter] Using system font: %s", candidate)
+            return _resolved_font_path
+
+    # 4. Auto-download — try each mirror URL in order
     dest = _FONTS_DIR / _FONT_FILENAME
-    log.info("[typesetter] No font in fonts/ — downloading %s …", _FONT_FILENAME)
-    try:
-        urllib.request.urlretrieve(_FONT_DOWNLOAD_URL, str(dest))
-        _resolved_font_path = dest
-        log.info("[typesetter] Font saved → %s", dest)
-        return _resolved_font_path
-    except Exception as exc:
-        raise RuntimeError(
-            f"No Hebrew font available and auto-download failed: {exc}\n"
-            f"  Fix: download any Hebrew TTF (e.g. Heebo-Bold.ttf) and place it in:\n"
-            f"       {_FONTS_DIR}"
-        ) from exc
+    last_exc: Exception | None = None
+    for url in _FONT_DOWNLOAD_URLS:
+        log.info("[typesetter] Trying font download: %s", url)
+        try:
+            urllib.request.urlretrieve(url, str(dest))
+            if dest.stat().st_size < 1000:          # sanity-check — not an error page
+                dest.unlink(missing_ok=True)
+                raise OSError("Downloaded file is too small — likely an error page.")
+            _resolved_font_path = dest
+            log.info("[typesetter] Font saved → %s", dest)
+            return _resolved_font_path
+        except Exception as exc:
+            log.warning("[typesetter] Download from %s failed: %s", url, exc)
+            last_exc = exc
+            if dest.exists():
+                dest.unlink(missing_ok=True)
+
+    raise RuntimeError(
+        f"No Hebrew font available and all auto-download attempts failed "
+        f"(last error: {last_exc}).\n"
+        f"  Fix: download any Hebrew TTF (e.g. Heebo-Bold.ttf) and place it in:\n"
+        f"       {_FONTS_DIR}"
+    ) from last_exc
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:

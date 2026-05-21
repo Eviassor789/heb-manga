@@ -4,15 +4,15 @@ Async retry utility with exponential backoff.
 Designed for the Gemini free tier (15 RPM) but generic enough to wrap any
 coroutine that may raise HTTP 429 / quota-exhausted errors.
 
-Delay schedule with default settings (base_delay=60 s, jitter=5 s):
+Delay schedule with default settings (base_delay=60 s, max_delay=120 s, jitter=5 s):
 
   attempt 1  →  ~60  s
-  attempt 2  →  ~120 s
-  attempt 3  →  ~240 s
-  attempt 4  →  ~480 s
+  attempt 2  →  ~120 s  (capped — would be 120 without cap)
+  attempt 3  →  ~120 s  (capped — would be 240)
+  attempt 4  →  ~120 s  (capped — would be 480)
 
-The base delay of 60 s is intentionally aligned with Gemini's 1-minute RPM
-reset window so the first retry almost always succeeds.
+The base delay of 60 s is aligned with Gemini's 1-minute RPM reset window.
+max_delay=120 s keeps total wait time sane for long chapters.
 """
 
 from __future__ import annotations
@@ -27,9 +27,10 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-_DEFAULT_BASE_DELAY  = 60.0   # seconds — matches Gemini's RPM reset window
+_DEFAULT_BASE_DELAY  = 60.0    # seconds — matches Gemini's RPM reset window
+_DEFAULT_MAX_DELAY   = 120.0   # hard ceiling — never wait longer than this
 _DEFAULT_MAX_RETRIES = 5
-_DEFAULT_JITTER      = 5.0    # random seconds added to avoid thundering herd
+_DEFAULT_JITTER      = 5.0     # random seconds added to avoid thundering herd
 
 
 class RateLimitError(Exception):
@@ -41,6 +42,7 @@ async def call_with_backoff(
     *,
     max_retries: int  = _DEFAULT_MAX_RETRIES,
     base_delay:  float = _DEFAULT_BASE_DELAY,
+    max_delay:   float = _DEFAULT_MAX_DELAY,
     jitter:      float = _DEFAULT_JITTER,
 ) -> T:
     """
@@ -54,6 +56,7 @@ async def call_with_backoff(
                   coroutine cannot be awaited again.
     max_retries : Maximum number of *retry* attempts (not counting the first).
     base_delay  : Seconds for the first retry delay.
+    max_delay   : Hard ceiling on any single delay (before jitter).
     jitter      : Maximum random seconds added to each delay to spread load.
 
     Raises
@@ -76,7 +79,7 @@ async def call_with_backoff(
             if attempt == max_retries:
                 break   # fall through to RateLimitError
 
-            delay = base_delay * (2 ** attempt) + random.uniform(0, jitter)
+            delay = min(base_delay * (2 ** attempt), max_delay) + random.uniform(0, jitter)
             log.warning(
                 "[rate_limiter] 429 / quota error (attempt %d/%d). "
                 "Retrying in %.0f s …",
