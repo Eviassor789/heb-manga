@@ -177,7 +177,12 @@ export default function HomePage() {
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail ?? 'Failed to start job.')
-      router.push(`/jobs/${data.job_id}`)
+      // Cache hit → send directly to the library reader
+      if (data.cached && data.library_id) {
+        router.push(`/library/${data.library_id}`)
+      } else {
+        router.push(`/jobs/${data.job_id}`)
+      }
     } catch (e: unknown) {
       setError(e instanceof Error ? e.message : 'Something went wrong.')
       setLoading(false)
@@ -228,6 +233,12 @@ export default function HomePage() {
         <p className="text-zinc-400 text-lg max-w-md mx-auto">
           Paste a MangaDex link or upload a file — we handle the rest.
         </p>
+        <a
+          href="/library"
+          className="inline-flex items-center gap-1.5 mt-4 text-sm text-zinc-500 hover:text-zinc-300 transition-colors"
+        >
+          <span>📚</span> Browse translated library
+        </a>
       </div>
 
       {/* Main card */}

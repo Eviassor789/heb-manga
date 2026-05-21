@@ -66,7 +66,7 @@ async def download_chapter(
     emit:      EmitFn,
     *,
     data_saver: bool = False,
-) -> list[Path]:
+) -> list[Path]:  # noqa: D401
     """
     Download all pages of a MangaDex chapter to <job_dir>/original/.
 
@@ -97,13 +97,12 @@ async def download_chapter(
         timeout=_REQUEST_TIMEOUT,
         follow_redirects=True,
     ) as client:
-        # ── Step A: Resolve chapter metadata ──────────────────────────────
-        chapter_label = await _fetch_chapter_label(client, chapter_id)
-
-        # ── Step B: Fetch CDN server info ─────────────────────────────────
-        base_url, img_hash, filenames = await _fetch_server_info(
-            client, chapter_id, data_saver=data_saver
+        # ── Step A: Resolve chapter metadata + CDN server info in parallel ─
+        (chapter_meta, (base_url, img_hash, filenames)) = await asyncio.gather(
+            _fetch_chapter_metadata(client, chapter_id),
+            _fetch_server_info(client, chapter_id, data_saver=data_saver),
         )
+        chapter_label = chapter_meta["label"]
 
         total = len(filenames)
         if total == 0:
@@ -140,8 +139,23 @@ async def download_chapter(
             if i < total:
                 await asyncio.sleep(_INTER_PAGE_DELAY)
 
-    # Persist title so the resume endpoint can surface it after history is cleared
+    # Persist title (legacy, used by resume endpoint)
     (job_dir / "chapter_title.txt").write_text(chapter_label, encoding="utf-8")
+
+    # Persist full metadata for library registration after pipeline completes
+    import json as _json  # noqa: PLC0415
+    meta_path = job_dir / "chapter_meta.json"
+    meta_path.write_text(
+        _json.dumps({
+            "mangadex_id":   chapter_id,
+            "manga_id":      chapter_meta.get("manga_id", ""),
+            "manga_title":   chapter_meta.get("manga_title", ""),
+            "chapter_num":   chapter_meta.get("chapter_num", ""),
+            "chapter_title": chapter_meta.get("chapter_title", ""),
+            "cover_url":     chapter_meta.get("cover_url", ""),
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
 
     await emit({
         "stage":         "download",
@@ -175,51 +189,95 @@ def _extract_uuid(url_or_id: str) -> str:
     return match.group(0).lower()
 
 
+# Public alias — use this to extract the chapter ID before starting a download
+# (needed by main.py for cache lookup prior to job creation)
+extract_chapter_id = _extract_uuid
+
+
 # ---------------------------------------------------------------------------
 # MangaDex API calls
 # ---------------------------------------------------------------------------
 
-async def _fetch_chapter_label(client: httpx.AsyncClient, chapter_id: str) -> str:
+async def _fetch_chapter_metadata(client: httpx.AsyncClient, chapter_id: str) -> dict:
     """
-    Return a human-readable label for the chapter ("Manga Title Ch. N").
+    Fetch chapter + manga info from MangaDex API and fetch the manga cover art.
 
-    Falls back to the chapter UUID on any error so the pipeline can continue.
+    Returns a dict with keys:
+      label          Human-readable "Manga Title Ch. N — Episode Title"
+      mangadex_id    Chapter UUID
+      manga_id       Manga UUID (empty string on error)
+      manga_title    English manga title (empty string on error)
+      chapter_num    Chapter number string, e.g. "12" or "12.5"
+      chapter_title  Episode title (may be empty)
+      cover_url      MangaDex CDN cover URL (512 px, empty string on error)
+
+    All fields degrade gracefully — errors fall back to empty strings so the
+    pipeline never aborts due to metadata issues.
     """
+    manga_id      = ""
+    manga_title   = ""
+    chapter_num   = "?"
+    chapter_title = ""
+    cover_url     = ""
+
     try:
         resp = await client.get(
             f"{_MD_API}/chapter/{chapter_id}",
             params={"includes[]": ["manga"]},
         )
         resp.raise_for_status()
-        data = resp.json().get("data", {})
+        data  = resp.json().get("data", {})
         attrs = data.get("attributes", {})
 
-        chapter_num = attrs.get("chapter") or "?"
-        title       = attrs.get("title") or ""
+        chapter_num   = attrs.get("chapter") or "?"
+        chapter_title = attrs.get("title")   or ""
 
-        # Dig out the manga title from relationships
-        manga_title = ""
         for rel in data.get("relationships", []):
             if rel.get("type") == "manga":
-                rel_attrs = rel.get("attributes") or {}
-                # title is a localised dict: {"en": "...", "ja": "..."}
-                titles = rel_attrs.get("title", {})
+                manga_id   = rel.get("id", "")
+                rel_attrs  = rel.get("attributes") or {}
+                titles     = rel_attrs.get("title", {})
                 manga_title = (
                     titles.get("en")
+                    or titles.get("ja-ro")
                     or next(iter(titles.values()), "")
                 )
                 break
 
-        parts = [manga_title] if manga_title else []
-        parts.append(f"Ch. {chapter_num}")
-        if title:
-            parts.append(f"— {title}")
-
-        return " ".join(parts) or chapter_id
-
     except Exception as exc:
         log.warning("[downloader] Could not fetch chapter metadata: %s", exc)
-        return chapter_id
+
+    # ── Cover art (best-effort, separate API call) ─────────────────────────────
+    if manga_id:
+        try:
+            cresp = await client.get(
+                f"{_MD_API}/cover",
+                params={"manga[]": manga_id, "limit": 1, "order[volume]": "asc"},
+            )
+            cresp.raise_for_status()
+            covers = cresp.json().get("data", [])
+            if covers:
+                fname     = covers[0]["attributes"]["fileName"]
+                cover_url = f"https://uploads.mangadex.org/covers/{manga_id}/{fname}.512.jpg"
+        except Exception as exc:
+            log.debug("[downloader] Could not fetch cover for manga %s: %s", manga_id, exc)
+
+    # ── Human-readable label ───────────────────────────────────────────────────
+    parts = [manga_title] if manga_title else []
+    parts.append(f"Ch. {chapter_num}")
+    if chapter_title:
+        parts.append(f"— {chapter_title}")
+    label = " ".join(parts) or chapter_id
+
+    return {
+        "label":         label,
+        "mangadex_id":   chapter_id,
+        "manga_id":      manga_id,
+        "manga_title":   manga_title,
+        "chapter_num":   chapter_num,
+        "chapter_title": chapter_title,
+        "cover_url":     cover_url,
+    }
 
 
 async def _fetch_server_info(

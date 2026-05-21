@@ -42,3 +42,8 @@ google-genai>=2.5.0          # new official Gemini SDK (replaces deprecated goog
 # After installing, run once:  modal token new
 # Then deploy the functions:   modal deploy modal_gpu.py
 modal>=0.64.0
+
+# ── Library — Supabase + Cloudflare R2 (optional) ───────────────────────────
+# Only active when SUPABASE_URL, SUPABASE_KEY, R2_* vars are set in .env
+supabase>=2.4.0           # Supabase Python client (PostgreSQL via PostgREST)
+aioboto3>=13.0.0          # Async AWS/S3-compatible client (used for Cloudflare R2)

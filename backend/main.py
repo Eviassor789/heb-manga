@@ -1,17 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-import io
+import json
 import shutil
 import uuid
 from pathlib import Path
 
-import img2pdf
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
-from PIL import Image
 from pydantic import BaseModel
 
 # Load backend/.env before any module reads os.getenv()
@@ -21,7 +19,9 @@ load_dotenv(override=True)
 
 from pipeline import detector, inpainter, ocr, splitter, translator, typesetter
 from core.job_manager import JobManager
-from core.manga_downloader import download_chapter
+from core.manga_downloader import download_chapter, extract_chapter_id
+from core.pdf_utils import build_compressed_pdf
+from core import library
 
 app = FastAPI(title="Hebrew Manga Translator API", version="0.1.0")
 
@@ -123,7 +123,20 @@ async def create_job_from_url(body: FetchChapterBody):
       { "url": "https://mangadex.org/chapter/<uuid>", "data_saver": false }
 
     data_saver: set true for lower-resolution images (faster download, smaller file).
+
+    If the chapter has already been translated (library cache hit), returns:
+      { "job_id": null, "cached": true, "library_id": "<uuid>" }
+    and no pipeline is started.  The frontend should redirect to /library/<library_id>.
     """
+    # ── Library cache check ────────────────────────────────────────────────────
+    try:
+        mangadex_id = extract_chapter_id(body.url)
+        cached = await library.check_cache(mangadex_id)
+        if cached:
+            return {"job_id": None, "cached": True, "library_id": cached["id"]}
+    except ValueError:
+        pass   # URL parse failure — let the pipeline give a proper error
+
     job_id  = str(uuid.uuid4())
     job_dir = _create_job_dirs(job_id)
 
@@ -132,7 +145,7 @@ async def create_job_from_url(body: FetchChapterBody):
         _run_pipeline_from_url(job_id, job_dir, body.url, body.data_saver)
     )
 
-    return {"job_id": job_id}
+    return {"job_id": job_id, "cached": False}
 
 
 @app.get("/api/jobs/{job_id}/status")
@@ -185,26 +198,8 @@ async def download_result(job_id: str, compressed: bool = False):
 
 
 def _build_compressed_pdf(output_dir: Path, dest: Path, quality: int = 85) -> None:
-    """
-    Re-encode output PNGs as JPEG and wrap them into a PDF.
-
-    quality=85 is the sweet spot: visually identical to lossless at ~15-20 % of the
-    PNG size. JPEG introduces subtle compression artefacts at hard edges, but manga
-    line art survives 85 % quality well. Go lower (70-75) if size matters more.
-    """
-    page_paths = sorted(p for p in output_dir.glob("*.png") if p.stem.isdigit())
-    if not page_paths:
-        raise RuntimeError("No output pages found to compress.")
-
-    jpeg_blobs: list[bytes] = []
-    for p in page_paths:
-        img = Image.open(p).convert("RGB")
-        buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=quality, optimize=True, subsampling=2)
-        jpeg_blobs.append(buf.getvalue())
-
-    with open(dest, "wb") as fh:
-        fh.write(img2pdf.convert(jpeg_blobs))
+    """Thin wrapper kept for the download endpoint; real logic lives in core/pdf_utils.py."""
+    build_compressed_pdf(output_dir, dest, quality=quality, save_pages=False)
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
@@ -356,8 +351,86 @@ async def _run_pipeline_from_url(
 
         await _run_pipeline_steps(job_id, job_dir, pages, emit)
 
+        # ── Library: upload to R2 + register in Supabase ──────────────────
+        # Runs after the "done" event is emitted so the user already has their
+        # download link; library registration is best-effort (errors are logged
+        # but never surface to the user).
+        asyncio.create_task(_register_in_library(job_dir))
+
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})
+
+
+# ---------------------------------------------------------------------------
+# Library helpers
+# ---------------------------------------------------------------------------
+
+async def _register_in_library(job_dir: Path) -> None:
+    """
+    Upload output files to R2 and register the chapter in Supabase.
+
+    Silently skipped when library is disabled.  Errors are logged but never
+    re-raised — the user already received their download link.
+    """
+    if not library.library_enabled():
+        return
+
+    meta_path = job_dir / "chapter_meta.json"
+    if not meta_path.exists():
+        return   # file-upload job (no MangaDex metadata)
+
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        mangadex_id = meta.get("mangadex_id", "")
+        if not mangadex_id:
+            return
+
+        pdf_url, pages_prefix, page_count, pdf_size_kb = (
+            await library.upload_chapter_files(job_dir, mangadex_id)
+        )
+
+        await library.register_chapter(
+            mangadex_id   = mangadex_id,
+            manga_title   = meta.get("manga_title", "Unknown"),
+            manga_id      = meta.get("manga_id", ""),
+            chapter_num   = meta.get("chapter_num", ""),
+            chapter_title = meta.get("chapter_title", ""),
+            cover_url     = meta.get("cover_url", ""),
+            page_count    = page_count,
+            pdf_url       = pdf_url,
+            pages_prefix  = pages_prefix,
+            pdf_size_kb   = pdf_size_kb,
+        )
+
+    except Exception as exc:
+        import logging
+        logging.getLogger(__name__).error("[library] _register_in_library failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Library API
+# ---------------------------------------------------------------------------
+
+@app.get("/api/library")
+async def get_library():
+    """
+    Return all completed chapters in the shared library, newest first.
+    Chapters are grouped by manga_id on the frontend.
+    """
+    chapters = await library.list_chapters()
+    return {"chapters": chapters, "library_enabled": library.library_enabled()}
+
+
+@app.get("/api/library/{chapter_id}")
+async def get_library_chapter(chapter_id: str):
+    """
+    Return a single chapter's metadata (including pdf_url and pages_prefix).
+    Used by the web reader page.
+    """
+    chapter = await library.get_chapter(chapter_id)
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found in library.")
+    return chapter
 
 
 # ---------------------------------------------------------------------------
