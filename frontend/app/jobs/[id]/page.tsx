@@ -1,11 +1,11 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
-type StageKey = 'download' | 'detect' | 'ocr' | 'inpaint' | 'translate' | 'typeset' | 'done'
+type StageKey = 'download' | 'detect' | 'ocr' | 'inpaint' | 'translate' | 'typeset'
 type StageStatus = 'waiting' | 'running' | 'done' | 'error'
 
 interface StageState {
@@ -13,34 +13,47 @@ interface StageState {
   page?: number
   total?: number
   message?: string
+  startedAt?: number
+  finishedAt?: number
 }
 
-interface StageInfo {
-  label: string
-  description: string
-  icon: string
+interface ActivityEntry {
+  ts: number
+  stage: string
+  text: string
 }
 
-// ── Stage metadata ────────────────────────────────────────────────────────────
+// ── Stage metadata ─────────────────────────────────────────────────────────────
 
 const STAGE_ORDER: StageKey[] = ['download', 'detect', 'ocr', 'inpaint', 'translate', 'typeset']
 
-const STAGE_INFO: Record<string, StageInfo> = {
-  download:  { label: 'Download',   description: 'Fetching pages from MangaDex CDN',        icon: '⬇️' },
-  detect:    { label: 'Detect',     description: 'Locating speech bubbles & text regions',   icon: '🔍' },
-  ocr:       { label: 'OCR',        description: 'Extracting Japanese text from each panel',  icon: '📖' },
-  inpaint:   { label: 'Inpaint',    description: 'Erasing original text with LaMa AI',        icon: '🎨' },
-  translate: { label: 'Translate',  description: 'Translating to Hebrew with Gemini',         icon: '🌐' },
-  typeset:   { label: 'Typeset',    description: 'Rendering Hebrew text with bidi support',   icon: '✍️' },
+const STAGE_INFO: Record<string, { label: string; desc: string; icon: string; verb: string }> = {
+  download:  { label: 'Download',  icon: '⬇',  desc: 'Fetching pages from MangaDex CDN',       verb: 'Downloading pages' },
+  detect:    { label: 'Detect',    icon: '🔍',  desc: 'Locating speech bubbles & text regions',  verb: 'Detecting text regions' },
+  ocr:       { label: 'OCR',       icon: '📖',  desc: 'Extracting Japanese text from panels',    verb: 'Reading text' },
+  inpaint:   { label: 'Inpaint',   icon: '🎨',  desc: 'Erasing original text with LaMa AI',     verb: 'Erasing text' },
+  translate: { label: 'Translate', icon: '🌐',  desc: 'Translating dialogue to Hebrew',          verb: 'Translating' },
+  typeset:   { label: 'Typeset',   icon: '✍',  desc: 'Rendering Hebrew text with RTL support',  verb: 'Typesetting' },
 }
 
-// ── Initial state helper ──────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
 function makeInitialStages(): Record<string, StageState> {
-  return Object.fromEntries(STAGE_ORDER.map((k) => [k, { status: 'waiting' as StageStatus }]))
+  return Object.fromEntries(STAGE_ORDER.map(k => [k, { status: 'waiting' as StageStatus }]))
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+function fmt(ms: number) {
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  return `${Math.floor(s / 60)}m ${s % 60}s`
+}
+
+function pct(page?: number, total?: number) {
+  if (!page || !total || total === 0) return 0
+  return Math.min(100, Math.round((page / total) * 100))
+}
+
+// ── Main component ─────────────────────────────────────────────────────────────
 
 export default function JobPage() {
   const { id } = useParams<{ id: string }>()
@@ -49,296 +62,588 @@ export default function JobPage() {
   const [stages, setStages] = useState<Record<string, StageState>>(makeInitialStages)
   const [downloadUrl, setDownloadUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [failedStage, setFailedStage] = useState<string | null>(null)
   const [chapterTitle, setChapterTitle] = useState<string | null>(null)
-  const [connected, setConnected] = useState(false)
   const [done, setDone] = useState(false)
-  const esRef = useRef<EventSource | null>(null)
+  const [activity, setActivity] = useState<ActivityEntry[]>([])
+  const [reconnectKey, setReconnectKey] = useState(0)
+  const [resuming, setResuming] = useState(false)
+  const [geminiCost, setGeminiCost] = useState<{
+    usd: number; ils: number; tokens: { input: number; output: number; think: number; total: number }
+  } | null>(null)
+  const [modalSeconds, setModalSeconds] = useState<Record<string, number>>({})
+
+  // Modal T4 effective rate — GPU ($0.59/hr) + memory overhead ≈ $1.00/hr total
+  const MODAL_T4_USD_PER_SEC = 0.000277
+  const ILS_PER_USD = 3.65
+
+  // Wall-clock timer (ticks every second while running)
+  const [tick, setTick] = useState(0)
+  const jobStartRef = useRef<number>(Date.now())
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+
+  const addActivity = useCallback((stage: string, text: string) => {
+    setActivity(prev => [...prev.slice(-29), { ts: Date.now(), stage, text }])
+  }, [])
+
+  // ── SSE connection ──────────────────────────────────────────────────────────
 
   useEffect(() => {
     if (!id) return
 
-    const es = new EventSource(`/api/jobs/${id}/status`)
-    esRef.current = es
-    setConnected(true)
+    jobStartRef.current = Date.now()
+    timerRef.current = setInterval(() => setTick(t => t + 1), 1000)
+
+    // Connect directly to FastAPI — Next.js proxies buffer SSE responses
+    // (Node.js fetch accumulates the body before streaming it through).
+    // CORS is already enabled on the backend for http://localhost:3000.
+    // In production, point NEXT_PUBLIC_BACKEND_URL at your reverse proxy.
+    const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'
+    const es = new EventSource(`${backendUrl}/api/jobs/${id}/status`)
 
     es.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data) as {
-          stage: string
-          status?: string
-          page?: number
-          total?: number
-          message?: string
-          download_url?: string
-          chapter_title?: string
+          stage: string; status?: string; page?: number; total?: number
+          message?: string; download_url?: string; chapter_title?: string
+          chapter?: string; total_pages?: number
+          cost?: { usd: number; ils: number; tokens: { input: number; output: number; think: number; total: number } }
+          modal_gpu_seconds?: number
+        }
+        const { stage, status, page, total, message, download_url, total_pages } = data
+        // Accumulate Gemini costs — both OCR and translate stages emit a `cost` payload
+        if (data.cost) {
+          const incoming = data.cost
+          setGeminiCost(prev => {
+            if (!prev) return incoming
+            return {
+              usd: prev.usd + incoming.usd,
+              ils: prev.ils + incoming.ils,
+              tokens: {
+                input:  prev.tokens.input  + incoming.tokens.input,
+                output: prev.tokens.output + incoming.tokens.output,
+                think:  prev.tokens.think  + incoming.tokens.think,
+                total:  prev.tokens.total  + incoming.tokens.total,
+              },
+            }
+          })
+        }
+        if (data.modal_gpu_seconds != null && data.modal_gpu_seconds > 0) {
+          setModalSeconds(prev => ({ ...prev, [stage]: data.modal_gpu_seconds! }))
         }
 
-        const { stage, status, page, total, message, download_url, chapter_title } = data
-
+        // Backend uses "chapter_title" (new) or "chapter" (legacy) — handle both
+        const chapter_title = data.chapter_title || data.chapter
         if (chapter_title) setChapterTitle(chapter_title)
 
+        // ── done ────────────────────────────────────────────────────────────
         if (stage === 'done') {
-          // Mark last real stage done, set download url
-          setStages((prev) => {
+          setStages(prev => {
             const next = { ...prev }
-            STAGE_ORDER.forEach((k) => {
-              if (next[k].status === 'running') next[k] = { status: 'done' }
+            STAGE_ORDER.forEach(k => {
+              if (next[k].status === 'running') next[k] = { ...next[k], status: 'done', finishedAt: Date.now() }
             })
             return next
           })
           if (download_url) setDownloadUrl(download_url)
           setDone(true)
+          clearInterval(timerRef.current!)
+          addActivity('done', '✓ Translation complete — PDF ready')
           es.close()
           return
         }
 
+        // ── error ───────────────────────────────────────────────────────────
         if (stage === 'error') {
-          setError(message ?? 'An unknown error occurred.')
-          setStages((prev) => {
+          setError(message ?? 'Unknown error')
+          setStages(prev => {
             const next = { ...prev }
-            STAGE_ORDER.forEach((k) => {
-              if (next[k].status === 'running') next[k] = { ...next[k], status: 'error', message }
+            let failed = ''
+            STAGE_ORDER.forEach(k => {
+              if (next[k].status === 'running') { next[k] = { ...next[k], status: 'error', message }; failed = k }
             })
+            if (failed) setFailedStage(failed)
             return next
           })
+          clearInterval(timerRef.current!)
+          addActivity('error', `✗ ${message ?? 'Pipeline error'}`)
           es.close()
           return
         }
 
-        // Normal stage progress event
-        setStages((prev) => {
-          const next = { ...prev }
+        // ── normal stage event ───────────────────────────────────────────────
+        const now = Date.now()
+        const currentStatus: StageStatus =
+          status === 'done' ? 'done' : status === 'error' ? 'error' : 'running'
 
-          // Mark previously running stages as done (stage transition)
-          STAGE_ORDER.forEach((k) => {
+        setStages(prev => {
+          const next = { ...prev }
+          // Finish any previously running stage (stage transition)
+          STAGE_ORDER.forEach(k => {
             if (k !== stage && next[k].status === 'running') {
-              next[k] = { status: 'done' }
+              next[k] = { ...next[k], status: 'done', finishedAt: now }
             }
           })
-
-          const currentStatus: StageStatus =
-            status === 'done' ? 'done' : status === 'error' ? 'error' : 'running'
-
-          next[stage] = { status: currentStatus, page, total, message }
+          const existing = next[stage] ?? { status: 'waiting' }
+          next[stage] = {
+            ...existing,
+            status: currentStatus,
+            page:   page ?? existing.page,
+            total:  total ?? total_pages ?? existing.total,
+            message,
+            startedAt: existing.startedAt ?? (currentStatus === 'running' ? now : undefined),
+            finishedAt: currentStatus === 'done' ? now : existing.finishedAt,
+          }
           return next
         })
-      } catch {
-        // ignore parse errors
-      }
+
+        // Activity log entry
+        if (page && total) {
+          addActivity(stage, `${STAGE_INFO[stage]?.verb ?? stage} — page ${page} / ${total}`)
+        } else if (currentStatus === 'done') {
+          const t = total ?? total_pages
+          addActivity(stage, `✓ ${STAGE_INFO[stage]?.label ?? stage} complete${t ? ` — ${t} pages` : ''}`)
+        } else if (currentStatus === 'running' && !page) {
+          addActivity(stage, `Starting ${STAGE_INFO[stage]?.label?.toLowerCase() ?? stage}…`)
+        }
+      } catch { /* ignore parse errors */ }
     }
 
-    es.onerror = () => {
-      setConnected(false)
-      // Don't set error — SSE naturally closes when job stream ends on server
-    }
+    es.onerror = () => { /* SSE closes naturally when job stream ends */ }
 
     return () => {
       es.close()
+      clearInterval(timerRef.current!)
     }
-  }, [id])
+  }, [id, reconnectKey, addActivity])
 
-  // ── Derived state ─────────────────────────────────────────────────────────
+  // ── Resume handler ──────────────────────────────────────────────────────────
 
-  const currentStageKey = STAGE_ORDER.find((k) => stages[k].status === 'running') ?? null
-  const hasStarted = STAGE_ORDER.some((k) => stages[k].status !== 'waiting')
+  const handleResume = async (fromStep: string) => {
+    setResuming(true)
+    setError(null)
+    setFailedStage(null)
+    setDone(false)
+    setDownloadUrl(null)
+    setActivity([])
+    setGeminiCost(null)
+    setModalSeconds({})
 
-  // ── Render ────────────────────────────────────────────────────────────────
+    // Reset stages from fromStep onward
+    const startIdx = STAGE_ORDER.indexOf(fromStep as StageKey)
+    setStages(prev => {
+      const next = { ...prev }
+      STAGE_ORDER.slice(startIdx).forEach(k => { next[k] = { status: 'waiting' } })
+      return next
+    })
+
+    try {
+      const res = await fetch(`/api/jobs/${id}/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ from_step: fromStep }),
+      })
+      if (!res.ok) {
+        const d = await res.json()
+        setError(d.detail ?? 'Resume failed')
+        setResuming(false)
+        return
+      }
+    } catch {
+      setError('Could not reach server')
+      setResuming(false)
+      return
+    }
+
+    jobStartRef.current = Date.now()
+    timerRef.current = setInterval(() => setTick(t => t + 1), 1000)
+    setResuming(false)
+    setReconnectKey(k => k + 1) // triggers SSE useEffect
+  }
+
+  // ── Derived ─────────────────────────────────────────────────────────────────
+
+  const totalElapsed = Date.now() - jobStartRef.current
+  const doneCount   = STAGE_ORDER.filter(k => stages[k].status === 'done').length
+  const overallPct  = done ? 100 : Math.round((doneCount / STAGE_ORDER.length) * 100 +
+    (() => {
+      const running = STAGE_ORDER.find(k => stages[k].status === 'running')
+      if (!running) return 0
+      const s = stages[running]
+      return (1 / STAGE_ORDER.length) * pct(s.page, s.total)
+    })())
+
+  const isRunning = !done && !error
+
+  // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
-    <main className="min-h-screen flex flex-col items-center px-4 py-16">
+    <main className="min-h-screen flex flex-col items-center px-4 py-10">
 
-      {/* Back link */}
-      <div className="w-full max-w-2xl mb-8">
-        <button
-          onClick={() => router.push('/')}
-          className="text-zinc-500 hover:text-zinc-300 text-sm transition-colors flex items-center gap-1"
-        >
+      {/* Back */}
+      <div className="w-full max-w-2xl mb-6">
+        <button onClick={() => router.push('/')}
+          className="text-zinc-500 hover:text-zinc-300 text-sm transition-colors flex items-center gap-1">
           ← New translation
         </button>
       </div>
 
-      {/* Header */}
-      <div className="w-full max-w-2xl mb-8 animate-fade-in">
-        <div className="flex items-start justify-between gap-4">
-          <div>
-            <h1 className="text-2xl font-bold text-zinc-50">
-              {done ? 'Translation Complete' : error ? 'Translation Failed' : 'Translating…'}
+      {/* Header card */}
+      <div className="w-full max-w-2xl card p-5 mb-4 animate-fade-in">
+        <div className="flex items-start justify-between gap-3 mb-4">
+          <div className="min-w-0">
+            <h1 className="text-lg font-bold text-zinc-50 truncate">
+              {chapterTitle ?? 'Translating…'}
             </h1>
-            {chapterTitle && (
-              <p className="text-zinc-400 text-sm mt-1">{chapterTitle}</p>
-            )}
-            <p className="text-zinc-600 text-xs mt-1 font-mono">{id}</p>
+            <p className="text-zinc-600 text-xs font-mono mt-0.5 truncate">{id}</p>
           </div>
-
-          {/* Status badge */}
-          <div className={`shrink-0 px-3 py-1.5 rounded-full text-xs font-semibold border ${
-            done
-              ? 'bg-green-950/50 border-green-700 text-green-400'
-              : error
-              ? 'bg-red-950/50 border-red-800 text-red-400'
-              : 'bg-blue-950/50 border-blue-800 text-blue-400'
+          <div className={`shrink-0 px-2.5 py-1 rounded-full text-xs font-semibold border ${
+            done  ? 'bg-green-950/60 border-green-700 text-green-400' :
+            error ? 'bg-red-950/60 border-red-800 text-red-400' :
+                    'bg-blue-950/60 border-blue-800 text-blue-400'
           }`}>
-            {done ? '✓ Done' : error ? '✗ Error' : connected ? '⟳ Running' : '○ Connecting…'}
+            {done ? '✓ Done' : error ? '✗ Failed' : isRunning ? '⟳ Running' : '○ Idle'}
           </div>
         </div>
-      </div>
 
-      {/* Stage timeline */}
-      <div className="w-full max-w-2xl animate-slide-in">
-        <div className="card p-6 space-y-1">
-          {STAGE_ORDER.map((key, idx) => {
-            const info = STAGE_INFO[key]
-            const state = stages[key]
-            const isLast = idx === STAGE_ORDER.length - 1
-
-            return (
-              <div key={key}>
-                <StageRow stageKey={key} info={info} state={state} />
-                {!isLast && (
-                  <div className={`ml-6 w-px h-4 mx-auto transition-colors duration-500 ${
-                    state.status === 'done' ? 'bg-green-700' : 'bg-zinc-800'
-                  }`} style={{ marginLeft: '1.75rem' }} />
-                )}
-              </div>
-            )
-          })}
+        {/* Overall progress bar */}
+        <div className="space-y-1.5">
+          <div className="flex justify-between text-xs text-zinc-500">
+            <span>{done ? 'Complete' : error ? 'Stopped' : `${overallPct}%`}</span>
+            <span className="tabular-nums">{fmt(tick > 0 || done ? totalElapsed : 0)}</span>
+          </div>
+          <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
+            <div
+              className={`h-full rounded-full transition-all duration-700 ease-out ${
+                done ? 'bg-green-500' : error ? 'bg-red-600' : 'bg-blue-500'
+              }`}
+              style={{ width: `${overallPct}%` }}
+            />
+          </div>
+          <p className="text-xs text-zinc-600">
+            {doneCount} / {STAGE_ORDER.length} stages complete
+          </p>
         </div>
       </div>
 
-      {/* Error panel */}
-      {error && (
-        <div className="w-full max-w-2xl mt-6 animate-fade-in">
+      {/* Stage list */}
+      <div className="w-full max-w-2xl card p-2 mb-4 animate-slide-in">
+        {STAGE_ORDER.map((key, idx) => (
+          <StageRow
+            key={key}
+            stageKey={key}
+            state={stages[key]}
+            isLast={idx === STAGE_ORDER.length - 1}
+            onResume={handleResume}
+            resuming={resuming}
+          />
+        ))}
+      </div>
+
+      {/* Error banner with resume */}
+      {error && failedStage && (
+        <div className="w-full max-w-2xl mb-4 animate-fade-in">
           <div className="px-5 py-4 bg-red-950/40 border border-red-800 rounded-2xl">
-            <p className="text-red-400 text-sm font-medium mb-1">Pipeline error</p>
-            <p className="text-red-300 text-sm font-mono whitespace-pre-wrap break-words">{error}</p>
-            <button
-              onClick={() => router.push('/')}
-              className="mt-4 btn-ghost text-sm px-4 py-2"
-            >
-              ← Try again
-            </button>
+            <div className="flex items-start gap-3">
+              <span className="text-red-400 text-lg shrink-0 mt-0.5">⚠</span>
+              <div className="flex-1 min-w-0">
+                <p className="text-red-400 text-sm font-medium">
+                  Failed during <span className="font-bold">{STAGE_INFO[failedStage]?.label}</span>
+                </p>
+                <p className="text-red-300/70 text-xs font-mono mt-1 break-words leading-relaxed">
+                  {error}
+                </p>
+              </div>
+            </div>
+            <div className="flex gap-3 mt-4">
+              <button
+                onClick={() => handleResume(failedStage)}
+                disabled={resuming}
+                className="btn-primary text-sm px-4 py-2 flex items-center gap-2"
+              >
+                {resuming ? <><Spinner /> Resuming…</> : <>↺ Retry from {STAGE_INFO[failedStage]?.label}</>}
+              </button>
+              <button onClick={() => router.push('/')} className="btn-ghost text-sm px-4 py-2">
+                Start over
+              </button>
+            </div>
           </div>
         </div>
       )}
 
       {/* Download panel */}
       {done && downloadUrl && (
-        <div className="w-full max-w-2xl mt-6 animate-fade-in">
-          <div className="card p-6 flex flex-col sm:flex-row items-center gap-4">
-            <div className="text-4xl">🎉</div>
-            <div className="flex-1 text-center sm:text-left">
-              <p className="font-semibold text-zinc-100">Your translated manga is ready!</p>
-              <p className="text-sm text-zinc-400 mt-0.5">
-                All pages have been translated to Hebrew and assembled into a PDF.
-              </p>
+        <div className="w-full max-w-2xl mb-4 animate-fade-in">
+          <div className="card p-5">
+            <div className="flex items-center gap-3 mb-4">
+              <span className="text-3xl">🎉</span>
+              <div>
+                <p className="font-semibold text-zinc-100">Translation complete!</p>
+                <p className="text-sm text-zinc-400 mt-0.5">Assembled into PDF · ready to download</p>
+              </div>
             </div>
-            <a
-              href={downloadUrl}
-              download
-              className="btn-primary shrink-0 flex items-center gap-2 no-underline"
-            >
-              <span>⬇</span>
-              Download PDF
+
+            <a href={`${downloadUrl}?compressed=true`} download
+              className="btn-primary w-full flex items-center justify-center gap-2 no-underline mb-4">
+              ⬇ Download PDF
             </a>
+
+            {/* Unified cost breakdown */}
+            {(geminiCost || Object.keys(modalSeconds).length > 0) && (() => {
+              const totalModalSec = Object.values(modalSeconds).reduce((a, b) => a + b, 0)
+              const modalUsd  = totalModalSec * MODAL_T4_USD_PER_SEC
+              const geminiUsd = geminiCost?.usd ?? 0
+              const totalUsd  = modalUsd + geminiUsd
+              const totalIls  = totalUsd * ILS_PER_USD
+
+              return (
+                <div className="mt-1 rounded-xl bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
+                  <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wide mb-2">
+                    Chapter cost
+                  </p>
+
+                  {/* Total */}
+                  <div className="flex items-baseline gap-2 mb-3">
+                    <span className="text-2xl font-bold text-zinc-100">
+                      ₪{totalIls.toFixed(3)}
+                    </span>
+                    <span className="text-sm text-zinc-500">
+                      / ${totalUsd.toFixed(4)} USD
+                    </span>
+                  </div>
+
+                  {/* Per-service breakdown */}
+                  <div className="grid grid-cols-2 gap-2 mb-3">
+                    {/* Modal */}
+                    <div className="bg-zinc-900/60 rounded-lg px-3 py-2">
+                      <div className="flex items-center justify-between mb-1">
+                        <p className="text-xs text-zinc-400 font-medium">Modal GPU</p>
+                        <p className="text-xs text-zinc-300 font-mono tabular-nums">
+                          ${modalUsd.toFixed(4)}
+                        </p>
+                      </div>
+                      <p className="text-xs text-zinc-600">
+                        {totalModalSec.toFixed(0)}s wall-clock · T4 GPU
+                      </p>
+                      {Object.keys(modalSeconds).length > 0 && (
+                        <div className="mt-1.5 space-y-0.5">
+                          {(['detect','ocr','inpaint'] as const).map(s =>
+                            modalSeconds[s] != null ? (
+                              <div key={s} className="flex justify-between text-xs text-zinc-600">
+                                <span className="capitalize">{s}</span>
+                                <span className="font-mono">{modalSeconds[s].toFixed(0)}s</span>
+                              </div>
+                            ) : null
+                          )}
+                        </div>
+                      )}
+                    </div>
+
+                    {/* Gemini */}
+                    <div className="bg-zinc-900/60 rounded-lg px-3 py-2">
+                      <div className="flex items-center justify-between mb-1">
+                        <p className="text-xs text-zinc-400 font-medium">Gemini API</p>
+                        <p className="text-xs text-zinc-300 font-mono tabular-nums">
+                          ${geminiUsd.toFixed(4)}
+                        </p>
+                      </div>
+                      <p className="text-xs text-zinc-600">
+                        {geminiCost ? `${geminiCost.tokens.total.toLocaleString()} tokens` : '—'}
+                      </p>
+                      {geminiCost && (
+                        <div className="mt-1.5 space-y-0.5">
+                          <div className="flex justify-between text-xs text-zinc-600">
+                            <span>Input</span>
+                            <span className="font-mono">{geminiCost.tokens.input.toLocaleString()}</span>
+                          </div>
+                          <div className="flex justify-between text-xs text-zinc-600">
+                            <span>Output</span>
+                            <span className="font-mono">{geminiCost.tokens.output.toLocaleString()}</span>
+                          </div>
+                          {geminiCost.tokens.think > 0 && (
+                            <div className="flex justify-between text-xs text-zinc-600">
+                              <span>Thinking</span>
+                              <span className="font-mono">{geminiCost.tokens.think.toLocaleString()}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-zinc-600 text-center">
+                    Modal T4 ~$1.00/hr (GPU+mem) · Gemini 2.5 Flash · ~₪{ILS_PER_USD}/USD
+                  </p>
+                </div>
+              )
+            })()}
           </div>
         </div>
       )}
 
-      {/* Waiting state — show skeleton hint */}
-      {!hasStarted && !error && (
-        <div className="w-full max-w-2xl mt-6 text-center animate-fade-in">
-          <p className="text-zinc-600 text-sm">Connecting to job stream…</p>
+      {/* Activity log */}
+      {activity.length > 0 && (
+        <div className="w-full max-w-2xl animate-fade-in">
+          <div className="card p-4">
+            <p className="text-xs font-semibold text-zinc-500 uppercase tracking-wide mb-3">Activity</p>
+            <div className="space-y-1 max-h-48 overflow-y-auto">
+              {[...activity].reverse().map((entry, i) => (
+                <div key={i} className="flex items-baseline gap-3 text-xs">
+                  <span className="text-zinc-700 tabular-nums shrink-0 font-mono">
+                    {new Date(entry.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+                  </span>
+                  <span className={`shrink-0 w-16 font-medium ${
+                    entry.stage === 'error' ? 'text-red-500' :
+                    entry.stage === 'done'  ? 'text-green-500' : 'text-zinc-500'
+                  }`}>
+                    {entry.stage === 'error' || entry.stage === 'done' ? '' : entry.stage}
+                  </span>
+                  <span className="text-zinc-400 leading-relaxed">{entry.text}</span>
+                </div>
+              ))}
+            </div>
+          </div>
         </div>
       )}
 
-      {/* Footer */}
-      <p className="mt-12 text-xs text-zinc-700 text-center">
-        Powered by comic-text-detector · EasyOCR · LaMa · Gemini · python-bidi
+      <p className="mt-8 text-xs text-zinc-700 text-center">
+        Powered by comic-text-detector · Gemini Vision · LaMa · Gemini 2.5 Flash · python-bidi
       </p>
     </main>
   )
 }
 
-// ── StageRow sub-component ────────────────────────────────────────────────────
+// ── StageRow ──────────────────────────────────────────────────────────────────
 
 function StageRow({
-  stageKey,
-  info,
-  state,
+  stageKey, state, isLast, onResume, resuming,
 }: {
   stageKey: string
-  info: StageInfo
   state: StageState
+  isLast: boolean
+  onResume: (step: string) => void
+  resuming: boolean
 }) {
-  const { status, page, total, message } = state
+  const info = STAGE_INFO[stageKey]
+  const { status, page, total, message, startedAt, finishedAt } = state
 
-  const iconBg =
-    status === 'done'
-      ? 'bg-green-900/60 border-green-700 text-green-400'
-      : status === 'running'
-      ? 'bg-blue-900/60 border-blue-700 text-blue-300 animate-pulse-fast'
-      : status === 'error'
-      ? 'bg-red-900/60 border-red-700 text-red-400'
-      : 'bg-zinc-800 border-zinc-700 text-zinc-600'
+  // Per-stage elapsed timer
+  const [stageElapsed, setStageElapsed] = useState(0)
+  useEffect(() => {
+    if (status !== 'running') { setStageElapsed(0); return }
+    const start = startedAt ?? Date.now()
+    const iv = setInterval(() => setStageElapsed(Date.now() - start), 500)
+    return () => clearInterval(iv)
+  }, [status, startedAt])
 
-  const labelColor =
-    status === 'done'
-      ? 'text-zinc-200'
-      : status === 'running'
-      ? 'text-zinc-100'
-      : status === 'error'
-      ? 'text-red-400'
-      : 'text-zinc-500'
+  const duration = finishedAt && startedAt ? finishedAt - startedAt : null
+  const progress = pct(page, total)
 
-  const descColor =
-    status === 'running' ? 'text-zinc-400' : status === 'done' ? 'text-zinc-500' : 'text-zinc-700'
+  const containerClass = [
+    'flex items-start gap-3 px-3 py-3 rounded-xl transition-all duration-300',
+    status === 'running' ? 'bg-blue-950/30' :
+    status === 'done'    ? 'bg-green-950/10' :
+    status === 'error'   ? 'bg-red-950/20' : '',
+    !isLast ? 'mb-0.5' : '',
+  ].join(' ')
+
+  const iconClass = [
+    'shrink-0 w-9 h-9 rounded-full border-2 flex items-center justify-center text-sm font-bold transition-all duration-300',
+    status === 'done'    ? 'border-green-600 bg-green-900/50 text-green-400' :
+    status === 'running' ? 'border-blue-500 bg-blue-900/50 text-blue-300' :
+    status === 'error'   ? 'border-red-600 bg-red-900/50 text-red-400' :
+                           'border-zinc-700 bg-zinc-800/50 text-zinc-600',
+  ].join(' ')
 
   return (
-    <div className={`flex items-start gap-4 p-3 rounded-xl transition-all duration-300 ${
-      status === 'running' ? 'bg-zinc-800/60' : ''
-    }`}>
-      {/* Icon circle */}
-      <div className={`shrink-0 w-9 h-9 rounded-full border flex items-center justify-center text-base transition-all duration-300 ${iconBg}`}>
-        {status === 'done' ? '✓' : status === 'error' ? '✗' : info.icon}
+    <div className={containerClass}>
+      {/* Icon */}
+      <div className={iconClass}>
+        {status === 'done'    ? '✓' :
+         status === 'error'   ? '✗' :
+         status === 'running' ? <Spinner /> :
+         info.icon}
       </div>
 
-      {/* Text content */}
-      <div className="flex-1 min-w-0">
-        <div className="flex items-center justify-between gap-2">
-          <span className={`text-sm font-semibold transition-colors duration-300 ${labelColor}`}>
+      {/* Content */}
+      <div className="flex-1 min-w-0 pt-1">
+        <div className="flex items-center justify-between gap-2 flex-wrap">
+          <span className={`text-sm font-semibold transition-colors duration-300 ${
+            status === 'done'    ? 'text-zinc-200' :
+            status === 'running' ? 'text-white' :
+            status === 'error'   ? 'text-red-400' : 'text-zinc-500'
+          }`}>
             {info.label}
           </span>
-          {status === 'running' && page != null && total != null && (
-            <span className="text-xs text-zinc-500 tabular-nums shrink-0">
-              {page} / {total}
-            </span>
-          )}
-          {status === 'done' && page != null && total != null && (
-            <span className="text-xs text-zinc-600 tabular-nums shrink-0">
-              {total} pages
-            </span>
-          )}
+
+          <div className="flex items-center gap-2 shrink-0">
+            {/* Page counter */}
+            {(status === 'running' || status === 'done') && page != null && total != null && (
+              <span className={`text-xs tabular-nums font-mono ${
+                status === 'done' ? 'text-green-600' : 'text-blue-400'
+              }`}>
+                {status === 'done' ? `${total} pages` : `${page} / ${total}`}
+              </span>
+            )}
+            {/* Duration */}
+            {status === 'running' && (
+              <span className="text-xs text-zinc-600 tabular-nums">{fmt(stageElapsed)}</span>
+            )}
+            {status === 'done' && duration != null && (
+              <span className="text-xs text-zinc-600 tabular-nums">{fmt(duration)}</span>
+            )}
+          </div>
         </div>
 
-        <p className={`text-xs mt-0.5 transition-colors duration-300 ${descColor}`}>
-          {status === 'error' && message ? message : info.description}
+        {/* Description / status text */}
+        <p className={`text-xs mt-0.5 transition-colors duration-300 ${
+          status === 'running' ? 'text-blue-400/80' :
+          status === 'done'    ? 'text-zinc-600' :
+          status === 'error'   ? 'text-red-400/80' : 'text-zinc-700'
+        }`}>
+          {status === 'error'   ? (message ?? info.desc) :
+           status === 'running' ? info.verb :
+                                  info.desc}
         </p>
 
         {/* Progress bar */}
-        {status === 'running' && page != null && total != null && total > 0 && (
-          <div className="mt-2 h-1 bg-zinc-700 rounded-full overflow-hidden">
+        {status === 'running' && total != null && total > 0 && (
+          <div className="mt-2 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
             <div
               className="h-full bg-blue-500 rounded-full transition-all duration-500 ease-out"
-              style={{ width: `${Math.min(100, (page / total) * 100)}%` }}
+              style={{ width: `${progress}%` }}
             />
           </div>
         )}
+        {/* Indeterminate bar when no page count yet */}
         {status === 'running' && (page == null || total == null) && (
-          <div className="mt-2 h-1 bg-zinc-700 rounded-full overflow-hidden">
-            <div className="h-full bg-blue-500 rounded-full animate-pulse w-1/3" />
+          <div className="mt-2 h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+            <div className="h-full w-1/3 bg-blue-500/60 rounded-full animate-pulse" />
           </div>
+        )}
+
+        {/* Per-stage resume button */}
+        {status === 'error' && (
+          <button
+            onClick={() => onResume(stageKey)}
+            disabled={resuming}
+            className="mt-2 text-xs px-3 py-1.5 rounded-lg border border-red-700/60 text-red-400 hover:bg-red-950/40 transition-colors flex items-center gap-1.5"
+          >
+            {resuming ? <><Spinner /> Resuming…</> : <>↺ Retry from here</>}
+          </button>
         )}
       </div>
     </div>
+  )
+}
+
+// ── Spinner ───────────────────────────────────────────────────────────────────
+
+function Spinner() {
+  return (
+    <svg className="animate-spin h-3.5 w-3.5" viewBox="0 0 24 24" fill="none">
+      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+    </svg>
   )
 }

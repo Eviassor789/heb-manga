@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import shutil
 import uuid
 from pathlib import Path
 
+import img2pdf
 from dotenv import load_dotenv
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
+from PIL import Image
 from pydantic import BaseModel
 
 # Load backend/.env before any module reads os.getenv()
@@ -149,13 +152,59 @@ async def job_status(job_id: str):
 
 
 @app.get("/api/jobs/{job_id}/download")
-async def download_result(job_id: str):
-    """Stream the finished translated PDF."""
+async def download_result(job_id: str, compressed: bool = False):
+    """
+    Stream the finished translated PDF.
+
+    ?compressed=true   — re-encodes pages as JPEG (quality 85) before PDF assembly.
+                         Typically reduces file size by 60-80 % with minimal visual loss.
+                         The compressed PDF is cached on disk after the first request.
+    """
     job_dir = _require_job(job_id)
-    result = job_dir / "output" / "result.pdf"
+    output_dir = job_dir / "output"
+
+    if compressed:
+        result = output_dir / "result_compressed.pdf"
+        if not result.exists():
+            full = output_dir / "result.pdf"
+            if not full.exists():
+                raise HTTPException(status_code=404, detail="Result not ready yet.")
+            # Generate compressed PDF in a thread (CPU-bound image work)
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, _build_compressed_pdf, output_dir, result)
+        return FileResponse(
+            result,
+            media_type="application/pdf",
+            filename="translated_manga_compressed.pdf",
+        )
+
+    result = output_dir / "result.pdf"
     if not result.exists():
         raise HTTPException(status_code=404, detail="Result not ready yet.")
     return FileResponse(result, media_type="application/pdf", filename="translated_manga.pdf")
+
+
+def _build_compressed_pdf(output_dir: Path, dest: Path, quality: int = 85) -> None:
+    """
+    Re-encode output PNGs as JPEG and wrap them into a PDF.
+
+    quality=85 is the sweet spot: visually identical to lossless at ~15-20 % of the
+    PNG size. JPEG introduces subtle compression artefacts at hard edges, but manga
+    line art survives 85 % quality well. Go lower (70-75) if size matters more.
+    """
+    page_paths = sorted(p for p in output_dir.glob("*.png") if p.stem.isdigit())
+    if not page_paths:
+        raise RuntimeError("No output pages found to compress.")
+
+    jpeg_blobs: list[bytes] = []
+    for p in page_paths:
+        img = Image.open(p).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True, subsampling=2)
+        jpeg_blobs.append(buf.getvalue())
+
+    with open(dest, "wb") as fh:
+        fh.write(img2pdf.convert(jpeg_blobs))
 
 
 @app.delete("/api/jobs/{job_id}", status_code=204)
@@ -197,8 +246,37 @@ async def resume_job(job_id: str, body: ResumeBody):
                    "Run a full job first before resuming.",
         )
 
-    # Re-register the job so SSE history is cleared and fresh events stream
+    # Salvage chapter title before history is cleared
+    title_file = job_dir / "chapter_title.txt"
+    chapter_title = (
+        title_file.read_text(encoding="utf-8").strip()
+        if title_file.exists() else None
+    )
+    # Fallback: scan old in-memory history (works if server hasn't restarted)
+    if not chapter_title:
+        for ev in job_manager._history.get(job_id, []):
+            chapter_title = ev.get("chapter_title") or ev.get("chapter")
+            if chapter_title:
+                break
+
+    # Re-register clears history and disconnects live subscribers
     job_manager.register_job(job_id)
+    emit = job_manager.get_emitter(job_id)
+
+    # Pre-populate history with synthetic "done" events for every stage that
+    # ran before from_step.  When the frontend connects (even mid-pipeline) it
+    # replays these and correctly shows earlier stages as completed.
+    total = len(pages)
+    _ordered = ["detect", "ocr", "inpaint", "translate", "typeset"]
+    start_idx = _ordered.index(body.from_step)
+
+    await emit({
+        "stage": "download", "status": "done", "total_pages": total,
+        **({"chapter_title": chapter_title} if chapter_title else {}),
+    })
+    for step in _ordered[:start_idx]:
+        await emit({"stage": step, "status": "done", "total_pages": total})
+
     asyncio.create_task(
         _run_pipeline_from_step(job_id, job_dir, pages, body.from_step)
     )

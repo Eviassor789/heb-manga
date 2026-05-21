@@ -28,6 +28,7 @@ from __future__ import annotations
 import asyncio
 import shutil
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -35,7 +36,12 @@ import cv2
 import numpy as np
 from PIL import Image
 
+import os as _os
+
 from core.job_manager import EmitFn
+
+# Set USE_MODAL=true in backend/.env to offload inpainting to Modal GPU.
+_USE_MODAL = _os.getenv("USE_MODAL", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Config
@@ -92,6 +98,7 @@ async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     Erase text regions from every page using the masks from Step 1.
 
     Writes cleaned images to <job_dir>/cleaned/.
+    If USE_MODAL=true, each page is sent to a Modal T4 GPU instead of running locally.
     Returns the same pages list unchanged (pipeline chaining convention).
     """
     await emit({"stage": "inpaint", "status": "running"})
@@ -100,18 +107,47 @@ async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     cleaned_dir   = job_dir / "cleaned"
     loop  = asyncio.get_running_loop()
     total = len(pages)
+    modal_seconds = 0.0
 
     for i, page_path in enumerate(pages, start=1):
         mask_path = detection_dir / f"{page_path.stem}_mask.png"
-        out_path  = cleaned_dir   / page_path.name   # same filename, different dir
+        out_path  = cleaned_dir   / page_path.name
 
-        await loop.run_in_executor(
-            _executor, _inpaint_page, page_path, mask_path, out_path
-        )
+        if _USE_MODAL:
+            t0 = time.perf_counter()
+            await _inpaint_page_modal(page_path, mask_path, out_path)
+            modal_seconds += time.perf_counter() - t0
+        else:
+            await loop.run_in_executor(_executor, _inpaint_page, page_path, mask_path, out_path)
         await emit({"stage": "inpaint", "status": "running", "page": i, "total": total})
 
-    await emit({"stage": "inpaint", "status": "done", "total_pages": total})
+    await emit({
+        "stage": "inpaint", "status": "done", "total_pages": total,
+        "modal_gpu_seconds": round(modal_seconds, 2),
+    })
     return pages
+
+
+_modal_inpaint_fn = None   # cached after first lookup
+
+async def _inpaint_page_modal(page_path: Path, mask_path: Path, out_path: Path) -> None:
+    """Send one page + mask to Modal GPU for LaMa inpainting."""
+    import asyncio, base64, modal
+
+    img_bytes = page_path.read_bytes()
+
+    if not mask_path.exists():
+        import shutil
+        shutil.copy2(page_path, out_path)
+        return
+
+    global _modal_inpaint_fn
+    if _modal_inpaint_fn is None:
+        _modal_inpaint_fn = modal.Function.from_name("hebrew-manga-translator", "inpaint_page")
+
+    mask_b64     = base64.b64encode(mask_path.read_bytes()).decode()
+    result_bytes = await asyncio.to_thread(_modal_inpaint_fn.remote, img_bytes, mask_b64)
+    out_path.write_bytes(result_bytes)
 
 
 # ---------------------------------------------------------------------------

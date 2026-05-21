@@ -130,21 +130,24 @@ async def download_chapter(
 
             pages.append(out_path)
             await emit({
-                "stage":   "download",
-                "status":  "running",
-                "page":    i,
-                "total":   total,
-                "chapter": chapter_label,
+                "stage":         "download",
+                "status":        "running",
+                "page":          i,
+                "total":         total,
+                "chapter_title": chapter_label,
             })
 
             if i < total:
                 await asyncio.sleep(_INTER_PAGE_DELAY)
 
+    # Persist title so the resume endpoint can surface it after history is cleared
+    (job_dir / "chapter_title.txt").write_text(chapter_label, encoding="utf-8")
+
     await emit({
-        "stage":   "download",
-        "status":  "done",
-        "total_pages": total,
-        "chapter": chapter_label,
+        "stage":         "download",
+        "status":        "done",
+        "total_pages":   total,
+        "chapter_title": chapter_label,
     })
 
     return sorted(pages)

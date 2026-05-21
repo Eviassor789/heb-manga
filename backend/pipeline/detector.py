@@ -26,6 +26,7 @@ import json
 import os
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -35,12 +36,16 @@ import numpy as np
 from core.job_manager import EmitFn
 
 # ---------------------------------------------------------------------------
-# Paths
+# Paths + Modal flag
 # ---------------------------------------------------------------------------
 
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 _VENDOR_DIR = _BACKEND_DIR / "vendor" / "comic-text-detector"
 _DEFAULT_MODEL = _BACKEND_DIR / "models" / "comic_text_detector" / "comictextdetector.pt"
+
+# Set USE_MODAL=true in backend/.env to offload detection to Modal GPU.
+# Requires:  pip install modal  +  modal token new  +  modal deploy modal_gpu.py
+_USE_MODAL = os.getenv("USE_MODAL", "false").lower() == "true"
 
 # ---------------------------------------------------------------------------
 # Singleton detector (thread-safe double-checked locking)
@@ -102,19 +107,60 @@ async def detect(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     Detect text regions across all pages.
 
     Writes per-page JSON + mask PNGs into <job_dir>/detection/.
+    If USE_MODAL=true, each page is sent to a Modal T4 GPU instead of running locally.
     Returns the same pages list unchanged (pipeline chaining convention).
     """
     await emit({"stage": "detect", "status": "running"})
     detection_dir = job_dir / "detection"
-    loop = asyncio.get_running_loop()
+    loop  = asyncio.get_running_loop()
     total = len(pages)
+    modal_seconds = 0.0
 
     for i, page_path in enumerate(pages, start=1):
-        await loop.run_in_executor(_executor, _detect_page, page_path, detection_dir)
+        if _USE_MODAL:
+            t0 = time.perf_counter()
+            await _detect_page_modal(page_path, detection_dir)
+            modal_seconds += time.perf_counter() - t0
+        else:
+            await loop.run_in_executor(_executor, _detect_page, page_path, detection_dir)
         await emit({"stage": "detect", "status": "running", "page": i, "total": total})
 
-    await emit({"stage": "detect", "status": "done", "total_pages": total})
+    await emit({
+        "stage": "detect", "status": "done", "total_pages": total,
+        "modal_gpu_seconds": round(modal_seconds, 2),
+    })
     return pages
+
+
+_modal_detect_fn = None   # cached after first lookup
+
+async def _detect_page_modal(page_path: Path, detection_dir: Path) -> None:
+    """Send one page to Modal GPU and write results to detection/ on disk."""
+    import asyncio, base64, json as _json, modal
+    global _modal_detect_fn
+
+    if _modal_detect_fn is None:
+        _modal_detect_fn = modal.Function.from_name("hebrew-manga-translator", "detect_page")
+
+    img_bytes = page_path.read_bytes()
+    result    = await asyncio.to_thread(_modal_detect_fn.remote, img_bytes)
+
+    # ── Write mask ────────────────────────────────────────────────────────────
+    mask_path = detection_dir / f"{page_path.stem}_mask.png"
+    mask_path.write_bytes(base64.b64decode(result["mask_b64"]))
+
+    # ── Write detection JSON ──────────────────────────────────────────────────
+    # Deduplicate before persisting (Modal result is raw model output)
+    deduped_regions = nms_regions(result["regions"])
+    page_data = {
+        "page":       page_path.name,
+        "image_size": result["image_size"],
+        "mask":       mask_path.name,
+        "regions":    deduped_regions,
+    }
+    (detection_dir / f"{page_path.stem}.json").write_text(
+        _json.dumps(page_data, ensure_ascii=False, indent=2), encoding="utf-8"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -159,6 +205,9 @@ def _detect_page(page_path: Path, detection_dir: Path) -> None:
             "source_text": None,  # populated by Step 2 — ocr.py
             "hebrew_text": None,  # populated by Step 4 — translator.py
         })
+
+    # Deduplicate: the model sometimes fires twice on the same balloon
+    regions = nms_regions(regions)
 
     page_data = {
         "page": page_path.name,
@@ -211,3 +260,84 @@ def _classify_type(blk) -> str:
     SFX regions are detected but skipped by the translator (Step 4).
     """
     return "sfx" if getattr(blk, "vertical", False) else "dialogue"
+
+
+# ---------------------------------------------------------------------------
+# Non-Maximum Suppression — deduplicates overlapping detections
+# ---------------------------------------------------------------------------
+
+_NMS_IOU_THRESHOLD = 0.45   # boxes with IoU above this are considered duplicates
+
+
+def _iou(a: list[int], b: list[int]) -> float:
+    """Intersection-over-Union for two [x1, y1, x2, y2] bounding boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union  = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _area(bbox: list[int]) -> int:
+    return max(0, bbox[2] - bbox[0]) * max(0, bbox[3] - bbox[1])
+
+
+def _containment(small: list[int], large: list[int]) -> float:
+    """Fraction of `small` that is covered by `large` (0–1)."""
+    ix1, iy1 = max(small[0], large[0]), max(small[1], large[1])
+    ix2, iy2 = min(small[2], large[2]), min(small[3], large[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    a = _area(small)
+    return inter / a if a > 0 else 0.0
+
+
+def nms_regions(regions: list[dict], iou_threshold: float = _NMS_IOU_THRESHOLD) -> list[dict]:
+    """
+    Remove near-duplicate regions produced by the detector.
+
+    Handles two distinct cases:
+
+    Case A — same bubble detected twice (IoU ≈ 0.95, boxes nearly identical):
+        Caught by the IoU threshold (0.45).
+
+    Case B — connected/adjacent bubbles where the detector fires one large box
+        covering both AND a smaller box covering just one (as happens with
+        partially-joined manga speech clouds).  IoU is low (~0.25) because the
+        large box is much bigger, so plain IoU misses this.  Caught by the
+        containment check: if ≥ 75 % of the candidate is already inside a
+        larger kept region, it is redundant and suppressed.
+
+    Sort order: (confidence DESC, area DESC) so larger / higher-confidence
+    boxes win when there is a tie.  This guarantees that when two boxes overlap
+    heavily, the bigger one (which has more complete text) is kept.
+    """
+    sorted_r = sorted(
+        regions,
+        key=lambda r: (r.get("confidence", 0.0), _area(r["bbox"])),
+        reverse=True,
+    )
+    kept: list[dict] = []
+    for candidate in sorted_r:
+        bbox_c = candidate["bbox"]
+        suppress = False
+        for k in kept:
+            bbox_k = k["bbox"]
+            if _iou(bbox_c, bbox_k) > iou_threshold:
+                suppress = True
+                break
+            # Containment: candidate is mostly inside a larger kept region
+            if _containment(bbox_c, bbox_k) > 0.75:
+                suppress = True
+                break
+        if not suppress:
+            kept.append(candidate)
+
+    # Re-assign contiguous IDs so downstream steps can use them as list indices
+    for new_id, region in enumerate(kept):
+        region["id"] = new_id
+
+    return kept

@@ -244,6 +244,10 @@ def _typeset_page(src_path: Path, json_path: Path, out_path: Path) -> None:
     if json_path.exists():
         page_data = json.loads(json_path.read_text(encoding="utf-8"))
 
+        # Safety-net dedup: drop any region whose bbox overlaps heavily with
+        # an already-rendered one (catches duplicates that survived detection).
+        rendered_bboxes: list[list[int]] = []
+
         for region in page_data.get("regions", []):
             hebrew = (region.get("hebrew_text") or "").strip()
             if not hebrew:
@@ -251,7 +255,17 @@ def _typeset_page(src_path: Path, json_path: Path, out_path: Path) -> None:
             if region.get("type") == "sfx":
                 continue   # SFX not typeset at MVP
 
-            _render_region(draw, hebrew, region["bbox"], img.size)
+            bbox = region["bbox"]
+            if any(_bbox_iou(bbox, rb) > 0.45 or _bbox_containment(bbox, rb) > 0.75
+                   for rb in rendered_bboxes):
+                log.debug(
+                    "[typesetter] Skipped duplicate region id=%s (bbox overlap)",
+                    region.get("id"),
+                )
+                continue
+
+            rendered_bboxes.append(bbox)
+            _render_region(draw, hebrew, bbox, img.size)
 
     img.save(str(out_path), format="PNG", optimize=False)
 
@@ -429,6 +443,32 @@ def _measure_width(text: str, font: ImageFont.FreeTypeFont) -> int:
     except AttributeError:
         bbox = font.getbbox(text)
         return bbox[2] - bbox[0]
+
+
+# ---------------------------------------------------------------------------
+# Bbox IoU helper (used by the typesetter safety-net dedup)
+# ---------------------------------------------------------------------------
+
+def _bbox_iou(a: list[int], b: list[int]) -> float:
+    """Intersection-over-Union for two [x1, y1, x2, y2] bounding boxes."""
+    ix1, iy1 = max(a[0], b[0]), max(a[1], b[1])
+    ix2, iy2 = min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    if inter == 0:
+        return 0.0
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    union  = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
+
+def _bbox_containment(small: list[int], large: list[int]) -> float:
+    """Fraction of `small` covered by `large`."""
+    ix1, iy1 = max(small[0], large[0]), max(small[1], large[1])
+    ix2, iy2 = min(small[2], large[2]), min(small[3], large[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    area = max(0, small[2] - small[0]) * max(0, small[3] - small[1])
+    return inter / area if area > 0 else 0.0
 
 
 # ---------------------------------------------------------------------------

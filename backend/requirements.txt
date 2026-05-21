@@ -36,3 +36,9 @@ google-genai>=2.5.0          # new official Gemini SDK (replaces deprecated goog
 # ── comic-text-detector: install manually (not on PyPI) ─────────────────────
 # git clone https://github.com/dmMaze/comic-text-detector
 # pip install -e ./comic-text-detector
+
+# ── Modal GPU offloading (optional) ─────────────────────────────────────────
+# Only needed if USE_MODAL=true in .env
+# After installing, run once:  modal token new
+# Then deploy the functions:   modal deploy modal_gpu.py
+modal>=0.64.0
