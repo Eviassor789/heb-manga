@@ -47,3 +47,6 @@ modal>=0.64.0
 # Only active when SUPABASE_URL, SUPABASE_KEY, R2_* vars are set in .env
 supabase>=2.4.0           # Supabase Python client (PostgreSQL via PostgREST)
 aioboto3>=13.0.0          # Async AWS/S3-compatible client (used for Cloudflare R2)
+
+# ── WeebCentral proxy ────────────────────────────────────────────────────────
+beautifulsoup4>=4.12.0    # HTML scraping for WeebCentral search proxy

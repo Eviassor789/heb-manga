@@ -280,6 +280,27 @@ async def resume_job(job_id: str, body: ResumeBody):
 
 
 # ---------------------------------------------------------------------------
+# Intermediate-file cleanup
+# ---------------------------------------------------------------------------
+
+async def _cleanup_intermediates(job_dir: Path) -> None:
+    """
+    Delete all intermediate pipeline artifacts after translation completes.
+    Only the output/ folder (compressed PDF + page JPEGs) is kept.
+    Runs in a thread so file I/O doesn't block the event loop.
+    """
+    def _do_cleanup() -> None:
+        for subdir in ("original", "detection", "cleaned", "translated"):
+            shutil.rmtree(job_dir / subdir, ignore_errors=True)
+        for fname in ("source.pdf", "source.zip"):
+            p = job_dir / fname
+            if p.exists():
+                p.unlink(missing_ok=True)
+
+    await asyncio.get_running_loop().run_in_executor(None, _do_cleanup)
+
+
+# ---------------------------------------------------------------------------
 # Shared pipeline steps (Steps 1-5 + done emit)
 # ---------------------------------------------------------------------------
 
@@ -332,6 +353,9 @@ async def _run_pipeline(job_id: str, source_file: Path) -> None:
 
         await _run_pipeline_steps(job_id, job_dir, pages, emit)
 
+        # ── Cleanup: remove intermediate dirs to save disk space ──────────
+        asyncio.create_task(_cleanup_intermediates(job_dir))
+
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})
 
@@ -351,11 +375,14 @@ async def _run_pipeline_from_url(
 
         await _run_pipeline_steps(job_id, job_dir, pages, emit)
 
-        # ── Library: upload to R2 + register in Supabase ──────────────────
-        # Runs after the "done" event is emitted so the user already has their
-        # download link; library registration is best-effort (errors are logged
-        # but never surface to the user).
-        asyncio.create_task(_register_in_library(job_dir))
+        # ── Cleanup: remove intermediate dirs to save disk space ──────────
+        asyncio.create_task(_cleanup_intermediates(job_dir))
+
+        # ── Library: build compressed PDF + register chapter ──────────────
+        # Runs after the "done" event so the user already has their download
+        # link.  Library registration is best-effort — errors are logged but
+        # never surface to the user.
+        asyncio.create_task(_register_in_library(job_dir, emit=emit))
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})
@@ -365,12 +392,15 @@ async def _run_pipeline_from_url(
 # Library helpers
 # ---------------------------------------------------------------------------
 
-async def _register_in_library(job_dir: Path) -> None:
+async def _register_in_library(job_dir: Path, emit=None) -> None:
     """
     Upload output files to R2 and register the chapter in Supabase.
 
     Silently skipped when library is disabled.  Errors are logged but never
     re-raised — the user already received their download link.
+
+    If `emit` is provided, fires a "library_ready" event with the new library_id
+    so the job-progress page can show a "Read in Hebrew" button immediately.
     """
     if not library.library_enabled():
         return
@@ -389,7 +419,7 @@ async def _register_in_library(job_dir: Path) -> None:
             await library.upload_chapter_files(job_dir, mangadex_id)
         )
 
-        await library.register_chapter(
+        library_id = await library.register_chapter(
             mangadex_id   = mangadex_id,
             manga_title   = meta.get("manga_title", "Unknown"),
             manga_id      = meta.get("manga_id", ""),
@@ -402,9 +432,317 @@ async def _register_in_library(job_dir: Path) -> None:
             pdf_size_kb   = pdf_size_kb,
         )
 
+        # Notify connected SSE subscribers that the reader is ready
+        if emit and library_id:
+            await emit({"stage": "library_ready", "library_id": library_id})
+
     except Exception as exc:
         import logging
         logging.getLogger(__name__).error("[library] _register_in_library failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# WeebCentral proxy  (avoids CORS — browser can't call weebcentral.com directly)
+# ---------------------------------------------------------------------------
+
+_WC_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0 Safari/537.36"
+    ),
+    "Accept": "text/html, application/json, */*",
+    "Referer": "https://weebcentral.com/",
+}
+
+import re as _re
+# WeebCentral real series IDs look like ULID: 26 uppercase alphanumeric chars.
+# This rejects navigation slugs like "random", "popular", "latest", etc.
+_WC_SERIES_ID_RE = _re.compile(r'^[0-9A-HJKMNP-TV-Z]{26}$', _re.I)
+
+
+def _parse_wc_series(html_text: str, *, limit: int = 30) -> list[dict]:
+    """
+    Parse WeebCentral HTML response and return a clean list of
+    { id, title, cover, url } dicts, deduplicated and validated.
+    """
+    from bs4 import BeautifulSoup
+
+    soup = BeautifulSoup(html_text, "html.parser")
+    out: list[dict] = []
+    seen: set[str] = set()
+
+    for link in soup.find_all("a", href=True):
+        href: str = link.get("href", "")
+        if "/series/" not in href:
+            continue
+
+        # Extract series ID and validate it's a real ULID (not "random" etc.)
+        series_id = href.rstrip("/").split("/series/")[-1].split("/")[0]
+        if not series_id or series_id in seen:
+            continue
+        if not _WC_SERIES_ID_RE.match(series_id):
+            continue  # skip slugs like "random", "popular", navigation links
+
+        img_tag = link.find("img")
+        cover   = img_tag.get("src", "").strip() if img_tag else ""
+
+        # Title: prefer img alt text, then first non-trivial text node
+        title = (img_tag.get("alt", "").strip() if img_tag else "") or ""
+        if not title:
+            for el in link.descendants:
+                t = el.get_text(strip=True) if hasattr(el, "get_text") else ""
+                if t and len(t) > 2:
+                    title = t
+                    break
+
+        if not title:
+            continue  # skip entries we can't name
+
+        seen.add(series_id)
+        out.append({
+            "id":    series_id,
+            "title": title,
+            "cover": cover,
+            "url":   f"https://weebcentral.com/series/{series_id}",
+        })
+        if len(out) >= limit:
+            break
+
+    return out
+
+
+@app.get("/api/search/weebcentral")
+async def search_weebcentral(q: str = ""):
+    """
+    Proxy WeebCentral search (GET /search/data) → JSON list of manga series.
+    We proxy it server-side to avoid CORS.
+
+    Returns: { results: [{ id, title, cover, url }] }
+    """
+    if not q.strip():
+        return {"results": []}
+
+    import httpx
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        try:
+            res = await client.get(
+                "https://weebcentral.com/search/data",
+                params={
+                    "text":         q,
+                    "sort":         "Best Match",
+                    "order":        "Descending",
+                    "official":     "Any",
+                    "anime":        "Any",
+                    "adult":        "Any",
+                    "display_mode": "Full Display",
+                    "author":       "",
+                },
+                headers={**_WC_HEADERS, "HX-Request": "true"},
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"WeebCentral unreachable: {exc}")
+
+    if not res.is_success:
+        raise HTTPException(status_code=502, detail="WeebCentral search returned an error.")
+
+    return {"results": _parse_wc_series(res.text)}
+
+
+@app.get("/api/weebcentral/featured")
+async def weebcentral_featured():
+    """
+    Scrape WeebCentral's main page and return the first ~24 series from the
+    Hot Updates section so the discover page has something to show on load.
+
+    Returns: { results: [{ id, title, cover, url }] }
+    """
+    import httpx
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
+        try:
+            res = await client.get("https://weebcentral.com/", headers=_WC_HEADERS)
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"WeebCentral unreachable: {exc}")
+
+    if not res.is_success:
+        raise HTTPException(status_code=502, detail="WeebCentral main page unavailable.")
+
+    return {"results": _parse_wc_series(res.text, limit=24)}
+
+
+@app.get("/api/weebcentral/series/{series_id}")
+async def weebcentral_series_info(series_id: str):
+    """
+    Return title, cover and description for a WeebCentral series by scraping its page.
+    Returns: { id, title, cover, description, url }
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
+        try:
+            res = await client.get(
+                f"https://weebcentral.com/series/{series_id}",
+                headers=_WC_HEADERS,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=str(exc))
+
+    if not res.is_success:
+        raise HTTPException(status_code=404, detail="Series not found on WeebCentral.")
+
+    soup = BeautifulSoup(res.text, "html.parser")
+
+    # Title — <h1> or <title> tag
+    title_tag = soup.find("h1") or soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else series_id
+    # Clean up " - WeebCentral" suffix from <title>
+    for suffix in [" - WeebCentral", " | WeebCentral"]:
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].strip()
+
+    # Cover — og:image meta or first series img
+    og_img = soup.find("meta", property="og:image")
+    cover  = og_img.get("content", "").strip() if og_img else ""
+    if not cover:
+        img = soup.find("img", alt=True)
+        cover = img.get("src", "").strip() if img else ""
+
+    # Description — WeebCentral puts it inside a <li> whose first child is
+    # <strong>Description</strong>, not in og:description (which is usually
+    # a generic site blurb).  Walk all <strong> elements to find it.
+    description = ""
+    for strong in soup.find_all("strong"):
+        if strong.get_text(strip=True).lower() == "description":
+            # The <p> sibling that holds the actual text
+            p = strong.find_next_sibling("p")
+            if p:
+                description = p.get_text(separator="\n", strip=True)
+                break
+    # Fallback to og:description if the section wasn't found
+    if not description:
+        og_desc = (soup.find("meta", property="og:description")
+                   or soup.find("meta", attrs={"name": "description"}))
+        description = og_desc.get("content", "").strip() if og_desc else ""
+
+    return {
+        "id":          series_id,
+        "title":       title,
+        "cover":       cover,
+        "description": description,
+        "url":         f"https://weebcentral.com/series/{series_id}",
+    }
+
+
+_WC_DATE_RE = _re.compile(
+    r'\d{4}-\d{2}-\d{2}|T\d{2}:\d{2}|last\s*read',
+    _re.IGNORECASE,
+)
+# ULID: exactly 26 chars from the Crockford Base32 alphabet
+_WC_ULID_RE = _re.compile(r'\b[0-9A-HJKMNP-TV-Z]{26}\b', _re.IGNORECASE)
+
+
+def _clean_chapter_label(link_tag) -> str:
+    """
+    Extract a clean chapter title from a WeebCentral chapter <a> element.
+
+    WeebCentral embeds "Last Read" labels, ISO timestamps, and raw ULID strings
+    as child elements inside the link.  We strip all of those so the result
+    contains only the human-readable part, e.g. "Chapter 12".
+    """
+    parts: list[str] = []
+    for child in link_tag.children:
+        text = (child.get_text(strip=True) if hasattr(child, "get_text")
+                else str(child).strip())
+        if not text:
+            continue
+        if _WC_DATE_RE.search(text):
+            continue
+        # Remove any embedded ULID tokens (e.g. "Chapter 01JCH988AN8EMQD6E3S81NEPX5")
+        text = _WC_ULID_RE.sub("", text).strip()
+        if text:
+            parts.append(text)
+    return " ".join(parts).strip()
+
+
+@app.get("/api/weebcentral/series/{series_id}/chapters")
+async def weebcentral_series_chapters(series_id: str):
+    """
+    Return the FULL chapter list for a WeebCentral series using the
+    /full-chapter-list endpoint (shows all chapters without needing "show all").
+
+    Returns: { chapters: [{ id, number, title, url }] }
+    Chapters are returned newest-first (WeebCentral's natural order).
+    """
+    import httpx
+    from bs4 import BeautifulSoup
+
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15.0) as client:
+        try:
+            res = await client.get(
+                f"https://weebcentral.com/series/{series_id}/full-chapter-list",
+                headers={**_WC_HEADERS, "HX-Request": "true"},
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=502, detail=f"WeebCentral unreachable: {exc}")
+
+    if not res.is_success:
+        raise HTTPException(status_code=404, detail="Chapter list not found on WeebCentral.")
+
+    soup = BeautifulSoup(res.text, "html.parser")
+    chapters: list[dict] = []
+    seen: set[str] = set()
+
+    for link in soup.find_all("a", href=True):
+        href: str = link.get("href", "")
+        if "/chapters/" not in href:
+            continue
+
+        ch_id = href.rstrip("/").split("/chapters/")[-1].split("/")[0]
+        if not ch_id or ch_id in seen:
+            continue
+        if not _WC_SERIES_ID_RE.match(ch_id):
+            continue
+        seen.add(ch_id)
+
+        # WeebCentral full-chapter-list structure inside each <a>:
+        #   <span class="me-2"><!-- checkmark SVG --></span>
+        #   <span class="grow flex items-center gap-2">
+        #     <span class="">Chapter 386</span>     ← title we want
+        #     <span x-show="last_read_...">...</span>   ← hidden "Last Read" badge
+        #     <span x-show="new_chapter">...</span>     ← hidden "NEW" badge
+        #   </span>
+        #   <time>Nov 13, 2024</time>
+        #
+        # We navigate directly to the first child <span> of the "grow" span
+        # to avoid touching the hidden badge text at all.
+        label = ""
+        grow_span = link.find("span", class_="grow")
+        if grow_span:
+            for child in grow_span.children:
+                if getattr(child, "name", None) == "span":
+                    text = child.get_text(strip=True)
+                    if text:
+                        label = text
+                        break
+
+        if not label:
+            continue  # skip entries we can't name cleanly
+
+        # Extract bare chapter number: "Chapter 386" → "386"
+        num_match = _re.search(r'(?:chapter|ch\.?)\s*([\d.]+)', label, _re.I)
+        number = num_match.group(1) if num_match else ""
+
+        chapters.append({
+            "id":     ch_id,
+            "number": number,
+            "title":  label,
+            "url":    f"https://weebcentral.com/chapters/{ch_id}",
+        })
+
+    return {"chapters": chapters}
 
 
 # ---------------------------------------------------------------------------
@@ -421,6 +759,18 @@ async def get_library():
     return {"chapters": chapters, "library_enabled": library.library_enabled()}
 
 
+@app.get("/api/library/manga/{mangadex_manga_id}")
+async def get_library_by_manga(mangadex_manga_id: str):
+    """
+    Return all translated chapters for a specific manga UUID.
+    Works in both local (SQLite) and cloud (Supabase) modes.
+
+    Returns: { chapters: [{id, mangadex_id, chapter_num, chapter_title}] }
+    """
+    chapters = await library.list_chapters_by_manga(mangadex_manga_id)
+    return {"chapters": chapters}
+
+
 @app.get("/api/library/{chapter_id}")
 async def get_library_chapter(chapter_id: str):
     """
@@ -431,6 +781,23 @@ async def get_library_chapter(chapter_id: str):
     if not chapter:
         raise HTTPException(status_code=404, detail="Chapter not found in library.")
     return chapter
+
+
+@app.get("/api/library/local-pages/{job_id}/{filename}")
+async def serve_local_page(job_id: str, filename: str):
+    """
+    Serve a single JPEG page from a locally stored translation job.
+
+    Used by the web reader in local mode (no Cloudflare R2 configured).
+    pages_prefix is set to /api/library/local-pages/{job_id} by the local
+    library backend; the reader appends /001.jpg, /002.jpg, … to load pages.
+    """
+    if not filename.endswith(".jpg"):
+        raise HTTPException(status_code=400, detail="Only .jpg files are served here.")
+    page_file = JOBS_DIR / job_id / "output" / "pages" / filename
+    if not page_file.exists():
+        raise HTTPException(status_code=404, detail="Page not found.")
+    return FileResponse(page_file, media_type="image/jpeg")
 
 
 # ---------------------------------------------------------------------------

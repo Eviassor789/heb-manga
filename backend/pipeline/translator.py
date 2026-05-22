@@ -252,12 +252,36 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
             async with glossary_lock:
                 glossary_snapshot = dict(glossary)
 
-            try:
-                translations, glossary_updates, page_tokens = await _translate_page(
-                    translatable, glossary_snapshot
-                )
-            except Exception as exc:
-                log.error("[translator] Page %s failed: %s", page_path.name, exc)
+            # Retry the entire page call on transient errors (network, API hiccup,
+            # bad response body).  We wait a few seconds between attempts so a
+            # brief service blip has time to recover.
+            translations: list[dict] = []
+            glossary_updates: dict[str, str] = {}
+            page_tokens: dict[str, int] = {"input": 0, "output": 0, "think": 0}
+            page_succeeded = False
+
+            for page_attempt in range(1, _MAX_PAGE_RETRIES + 2):  # +2 → 1 initial + N retries
+                try:
+                    translations, glossary_updates, page_tokens = await _translate_page(
+                        translatable, glossary_snapshot
+                    )
+                    page_succeeded = True
+                    break
+                except Exception as exc:
+                    if page_attempt <= _MAX_PAGE_RETRIES:
+                        wait = page_attempt * 5.0
+                        log.warning(
+                            "[translator] Page %s failed (attempt %d/%d): %s — retry in %.0f s",
+                            page_path.name, page_attempt, _MAX_PAGE_RETRIES + 1, exc, wait,
+                        )
+                        await asyncio.sleep(wait)
+                    else:
+                        log.error(
+                            "[translator] Page %s failed after %d attempts: %s — skipping.",
+                            page_path.name, _MAX_PAGE_RETRIES + 1, exc,
+                        )
+
+            if not page_succeeded:
                 async with completed_lock:
                     completed += 1
                     await emit({"stage": "translate", "status": "running",
@@ -342,7 +366,8 @@ def _get_translatable(regions: list[dict]) -> list[dict]:
     ]
 
 
-_MAX_RETRY_ATTEMPTS = 2  # extra attempts to fill missing / null translations
+_MAX_RETRY_ATTEMPTS  = 4   # extra per-region retry attempts (blank/null hebrew_text)
+_MAX_PAGE_RETRIES    = 3   # retries when the ENTIRE page call fails (network/API error)
 
 
 async def _translate_page(

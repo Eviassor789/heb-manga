@@ -1,492 +1,200 @@
 'use client'
 
-import { useState, useRef, useCallback, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
+import { useEffect, useMemo, useState } from 'react'
+import Link from 'next/link'
+import MangaCard from '@/components/MangaCard'
+import SkeletonCard from '@/components/SkeletonCard'
+import Spinner from '@/components/Spinner'
 
-// ── URL validation helpers ────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────────────────────
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
-const MANGADEX_CHAPTER_RE =
-  /mangadex\.org\/chapter\/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i
-
-function extractUUID(raw: string): string | null {
-  const s = raw.trim()
-  if (UUID_RE.test(s)) return s
-  const m = s.match(MANGADEX_CHAPTER_RE)
-  return m ? m[1] : null
+interface LibraryChapter {
+  id:            string
+  mangadex_id:   string   // MangaDex chapter UUID
+  manga_id:      string   // MangaDex manga UUID
+  manga_title:   string
+  chapter_num:   string | null
+  chapter_title: string | null
+  cover_url:     string | null
+  page_count:    number | null
+  translated_at: string
 }
 
-function isMangaDexLike(raw: string): boolean {
-  const s = raw.trim()
-  if (!s) return true // empty is fine, don't show error yet
-  return extractUUID(s) !== null
+interface MangaSeries {
+  manga_id:      string
+  manga_title:   string
+  cover_url:     string | null
+  chapter_count: number
+  latest_at:     string   // ISO timestamp of the most recent chapter
 }
 
-// ── Chapter preview type ──────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────────
 
-interface ChapterPreview {
-  mangaTitle: string
-  chapterNum: string | null
-  chapterTitle: string | null
-  language: string
+/**
+ * MangaDex IDs are UUIDs:  xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+ * WeebCentral IDs are ULIDs: 26 uppercase alphanumeric chars (no dashes)
+ * We use the presence of dashes to distinguish them.
+ */
+function seriesHref(manga_id: string): string {
+  if (!manga_id) return '/discover'
+  // ULID: 26 chars, no hyphens
+  if (/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(manga_id)) return `/weebcentral/${manga_id}`
+  return `/manga/${manga_id}`
 }
 
-async function fetchChapterPreview(uuid: string): Promise<ChapterPreview> {
-  const res = await fetch(
-    `https://api.mangadex.org/chapter/${uuid}?includes[]=manga`,
-    { signal: AbortSignal.timeout(6000) },
-  )
-  if (!res.ok) throw new Error('Chapter not found')
-  const json = await res.json()
-  const attrs = json.data?.attributes ?? {}
-  const mangaRel = (json.data?.relationships ?? []).find((r: { type: string }) => r.type === 'manga')
-  const titles: Record<string, string> = mangaRel?.attributes?.title ?? {}
-  const mangaTitle =
-    titles['en'] ?? titles['ja-ro'] ?? titles['ja'] ?? Object.values(titles)[0] ?? 'Unknown manga'
-
-  return {
-    mangaTitle,
-    chapterNum: attrs.chapter ?? null,
-    chapterTitle: attrs.title ?? null,
-    language: attrs.translatedLanguage ?? '??',
+function groupBySeries(chapters: LibraryChapter[]): MangaSeries[] {
+  const map = new Map<string, MangaSeries>()
+  for (const ch of chapters) {
+    const key = ch.manga_id || ch.manga_title
+    if (!map.has(key)) {
+      map.set(key, {
+        manga_id:      ch.manga_id,
+        manga_title:   ch.manga_title,
+        cover_url:     ch.cover_url,
+        chapter_count: 0,
+        latest_at:     ch.translated_at,
+      })
+    }
+    const s = map.get(key)!
+    s.chapter_count++
+    if (ch.translated_at > s.latest_at) s.latest_at = ch.translated_at
   }
+  // Sort by most-recently-translated first
+  return [...map.values()].sort((a, b) => b.latest_at.localeCompare(a.latest_at))
 }
 
-// ── Component ─────────────────────────────────────────────────────────────────
+// ── Component ──────────────────────────────────────────────────────────────────
 
-export default function HomePage() {
-  const router = useRouter()
-  const [tab, setTab] = useState<'url' | 'file'>('url')
-
-  // URL tab state
-  const [url, setUrl] = useState('')
-  const [dataSaver, setDataSaver] = useState(false)
-  const [urlValid, setUrlValid] = useState<boolean | null>(null) // null = empty
-  const [preview, setPreview] = useState<ChapterPreview | null>(null)
-  const [previewLoading, setPreviewLoading] = useState(false)
-  const [previewError, setPreviewError] = useState<string | null>(null)
-  const previewAbortRef = useRef<AbortController | null>(null)
-  const previewTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
-
-  // File tab state
-  const [file, setFile] = useState<File | null>(null)
-  const [dragging, setDragging] = useState(false)
-
-  // Shared state
-  const [loading, setLoading] = useState(false)
-  const [error, setError] = useState('')
-  const fileRef = useRef<HTMLInputElement>(null)
-
-  // ── URL validation + preview (debounced) ───────────────────────────────────
+export default function LibraryPage() {
+  const [chapters,       setChapters]       = useState<LibraryChapter[]>([])
+  const [loading,        setLoading]        = useState(true)
+  const [libraryEnabled, setLibraryEnabled] = useState(true)
+  const [search,         setSearch]         = useState('')
 
   useEffect(() => {
-    const raw = url.trim()
-
-    // Clear old timer/abort
-    if (previewTimerRef.current) clearTimeout(previewTimerRef.current)
-    previewAbortRef.current?.abort()
-
-    if (!raw) {
-      setUrlValid(null)
-      setPreview(null)
-      setPreviewError(null)
-      return
-    }
-
-    const uuid = extractUUID(raw)
-
-    if (!uuid) {
-      setUrlValid(false)
-      setPreview(null)
-      setPreviewError(null)
-      return
-    }
-
-    setUrlValid(true)
-    setPreview(null)
-    setPreviewError(null)
-    setPreviewLoading(true)
-
-    previewTimerRef.current = setTimeout(async () => {
-      const ctrl = new AbortController()
-      previewAbortRef.current = ctrl
-      try {
-        const info = await fetchChapterPreview(uuid)
-        if (!ctrl.signal.aborted) {
-          setPreview(info)
-          setPreviewLoading(false)
-        }
-      } catch {
-        if (!ctrl.signal.aborted) {
-          setPreviewError('Could not fetch chapter info — it will still translate fine.')
-          setPreviewLoading(false)
-        }
-      }
-    }, 500)
-
-    return () => {
-      if (previewTimerRef.current) clearTimeout(previewTimerRef.current)
-      previewAbortRef.current?.abort()
-    }
-  }, [url])
-
-  // ── Paste from clipboard ───────────────────────────────────────────────────
-
-  const pasteFromClipboard = async () => {
-    try {
-      const text = await navigator.clipboard.readText()
-      if (text) {
-        setUrl(text)
-        setError('')
-      }
-    } catch {
-      // Clipboard not available — ignore silently
-    }
-  }
-
-  // ── Drag & drop ────────────────────────────────────────────────────────────
-
-  const onDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault()
-    setDragging(false)
-    const dropped = e.dataTransfer.files[0]
-    if (dropped) {
-      const ext = dropped.name.split('.').pop()?.toLowerCase()
-      if (ext === 'pdf' || ext === 'zip') {
-        setFile(dropped)
-        setError('')
-      } else {
-        setError('Only .pdf and .zip files are supported.')
-      }
-    }
+    fetch('/api/library')
+      .then(r => r.json())
+      .then(data => {
+        setChapters(data.chapters ?? [])
+        setLibraryEnabled(data.library_enabled ?? false)
+      })
+      .catch(() => {/* backend not reachable — show empty state */})
+      .finally(() => setLoading(false))
   }, [])
 
-  // ── Submit handlers ────────────────────────────────────────────────────────
+  const series = useMemo(() => {
+    const all = groupBySeries(chapters)
+    if (!search.trim()) return all
+    const q = search.toLowerCase()
+    return all.filter(s => s.manga_title.toLowerCase().includes(q))
+  }, [chapters, search])
 
-  const submitUrl = async () => {
-    const raw = url.trim()
-    if (!raw) { setError('Please enter a MangaDex chapter URL.'); return }
-    if (!extractUUID(raw)) { setError('This doesn\'t look like a MangaDex chapter URL or UUID.'); return }
-    setLoading(true)
-    setError('')
-    try {
-      const res = await fetch('/api/jobs/from-url', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: raw, data_saver: dataSaver }),
-      })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail ?? 'Failed to start job.')
-      // Cache hit → send directly to the library reader
-      if (data.cached && data.library_id) {
-        router.push(`/library/${data.library_id}`)
-      } else {
-        router.push(`/jobs/${data.job_id}`)
-      }
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Something went wrong.')
-      setLoading(false)
-    }
-  }
+  const totalChapters = chapters.length
+  const totalSeries   = groupBySeries(chapters).length
 
-  const submitFile = async () => {
-    if (!file) { setError('Please select a file.'); return }
-    setLoading(true)
-    setError('')
-    try {
-      const form = new FormData()
-      form.append('file', file)
-      const res = await fetch('/api/jobs', { method: 'POST', body: form })
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.detail ?? 'Failed to start job.')
-      router.push(`/jobs/${data.job_id}`)
-    } catch (e: unknown) {
-      setError(e instanceof Error ? e.message : 'Something went wrong.')
-      setLoading(false)
-    }
-  }
-
-  const handleSubmit = tab === 'url' ? submitUrl : submitFile
-
-  // ── URL input border color ─────────────────────────────────────────────────
-
-  const inputBorderClass =
-    urlValid === false
-      ? 'border-red-600 focus:ring-red-500'
-      : urlValid === true
-      ? 'border-green-700 focus:ring-green-500'
-      : '' // default from .input class
-
-  // ── Render ─────────────────────────────────────────────────────────────────
+  // ── Render ──────────────────────────────────────────────────────────────────
 
   return (
-    <main className="min-h-screen flex flex-col items-center justify-center px-4 py-16">
+    <main className="min-h-screen px-4 py-8 max-w-6xl mx-auto">
 
-      {/* Header */}
-      <div className="text-center mb-12 animate-fade-in">
-        <div className="inline-flex items-center gap-3 mb-4">
-          <span className="text-4xl">🈺</span>
-          <h1 className="text-4xl font-bold tracking-tight text-zinc-50">
-            Hebrew Manga Translator
-          </h1>
-        </div>
-        <p className="text-zinc-400 text-lg max-w-md mx-auto">
-          Paste a MangaDex link or upload a file — we handle the rest.
-        </p>
-        <a
-          href="/library"
-          className="inline-flex items-center gap-1.5 mt-4 text-sm text-zinc-500 hover:text-zinc-300 transition-colors"
-        >
-          <span>📚</span> Browse translated library
-        </a>
+      {/* ── Hero ── */}
+      <div className="mb-8">
+        <h1 className="text-3xl font-bold text-zinc-50 mb-1">
+          📚 Hebrew Manga Library
+        </h1>
+        {!loading && (
+          <p className="text-zinc-500 text-sm">
+            {totalSeries > 0
+              ? `${totalSeries} series · ${totalChapters} chapters translated into Hebrew`
+              : libraryEnabled
+              ? 'No translations yet — be the first!'
+              : 'Library not configured — see setup guide'}
+          </p>
+        )}
       </div>
 
-      {/* Main card */}
-      <div className="card w-full max-w-xl p-8 animate-slide-in">
+      {/* ── Search + CTA ── */}
+      <div className="flex gap-3 mb-8 flex-wrap">
+        <input
+          className="input flex-1 min-w-48 text-sm"
+          placeholder="Filter by manga title…"
+          value={search}
+          onChange={e => setSearch(e.target.value)}
+        />
+        <Link href="/discover" className="btn-primary flex items-center gap-2 whitespace-nowrap">
+          <span>🔍</span> Find manga
+        </Link>
+      </div>
 
-        {/* Tab switcher */}
-        <div className="flex gap-1 bg-zinc-800 p-1 rounded-xl mb-8">
-          {(['url', 'file'] as const).map((t) => (
-            <button
-              key={t}
-              onClick={() => { setTab(t); setError('') }}
-              className={`flex-1 py-2 rounded-lg text-sm font-medium transition-all duration-150 ${
-                tab === t
-                  ? 'bg-zinc-700 text-zinc-100 shadow-sm'
-                  : 'text-zinc-400 hover:text-zinc-200'
-              }`}
-            >
-              {t === 'url' ? '🔗 MangaDex URL' : '📁 Upload File'}
-            </button>
+      {/* ── Loading grid ── */}
+      {loading && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+          {Array.from({ length: 12 }).map((_, i) => <SkeletonCard key={i} />)}
+        </div>
+      )}
+
+      {/* ── Not configured ── */}
+      {!loading && !libraryEnabled && (
+        <div className="card p-10 text-center max-w-lg mx-auto mt-12 space-y-4">
+          <p className="text-4xl">🔧</p>
+          <h2 className="text-lg font-semibold text-zinc-200">Library not set up</h2>
+          <p className="text-zinc-400 text-sm leading-relaxed">
+            The library is always active — translated chapters are saved locally.
+            To host files on Cloudflare R2 (permanent public URLs), add your R2
+            credentials to{' '}
+            <code className="bg-zinc-800 px-1.5 py-0.5 rounded text-xs text-zinc-300">backend/.env</code>.
+          </p>
+          <Link href="/translate" className="btn-primary inline-flex mt-2">
+            Translate a chapter
+          </Link>
+        </div>
+      )}
+
+      {/* ── Empty state (library enabled but no chapters yet) ── */}
+      {!loading && libraryEnabled && series.length === 0 && !search && (
+        <div className="card p-10 text-center max-w-lg mx-auto mt-12 space-y-4">
+          <p className="text-5xl">📭</p>
+          <h2 className="text-xl font-semibold text-zinc-200">The library is empty</h2>
+          <p className="text-zinc-400 text-sm leading-relaxed">
+            Translate your first chapter and it will appear here for everyone to read.
+          </p>
+          <Link href="/discover" className="btn-primary inline-flex gap-2">
+            <span>🔍</span> Find a manga to translate
+          </Link>
+        </div>
+      )}
+
+      {/* ── No search results ── */}
+      {!loading && series.length === 0 && search && (
+        <div className="text-center py-16 text-zinc-500">
+          No manga matching <span className="text-zinc-300">&ldquo;{search}&rdquo;</span>
+        </div>
+      )}
+
+      {/* ── Manga grid ── */}
+      {!loading && series.length > 0 && (
+        <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+          {series.map(s => (
+            <MangaCard
+              key={s.manga_id || s.manga_title}
+              href={seriesHref(s.manga_id)}
+              title={s.manga_title}
+              coverUrl={s.cover_url}
+              subtitle={`${s.chapter_count} chapter${s.chapter_count !== 1 ? 's' : ''} in Hebrew`}
+            />
           ))}
+
+          {/* "+" card to discover more */}
+          <Link
+            href="/discover"
+            className="group flex flex-col items-center justify-center aspect-[3/4] rounded-xl border-2 border-dashed border-[var(--card-border)] hover:border-[var(--accent)] hover:bg-[var(--accent-subtle)] transition-all duration-200 text-zinc-600 hover:text-[var(--accent)]"
+          >
+            <span className="text-3xl mb-2 group-hover:scale-110 transition-transform">＋</span>
+            <span className="text-xs font-medium">Add manga</span>
+          </Link>
         </div>
+      )}
 
-        {/* ── URL tab ── */}
-        {tab === 'url' && (
-          <div className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-zinc-400 mb-2">
-                Chapter URL or UUID
-              </label>
-
-              {/* Input row */}
-              <div className="relative flex items-center gap-2">
-                <div className="relative flex-1">
-                  <input
-                    className={`input pr-8 ${inputBorderClass}`}
-                    type="text"
-                    placeholder="https://mangadex.org/chapter/…"
-                    value={url}
-                    onChange={(e) => { setUrl(e.target.value); setError('') }}
-                    onKeyDown={(e) => e.key === 'Enter' && !loading && handleSubmit()}
-                    spellCheck={false}
-                  />
-                  {/* Validation icon inside input */}
-                  {urlValid === true && (
-                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-green-500 text-sm select-none">✓</span>
-                  )}
-                  {urlValid === false && (
-                    <span className="absolute right-3 top-1/2 -translate-y-1/2 text-red-500 text-sm select-none">✗</span>
-                  )}
-                  {/* Clear button */}
-                  {url && urlValid === null && (
-                    <button
-                      onClick={() => { setUrl(''); setError('') }}
-                      className="absolute right-3 top-1/2 -translate-y-1/2 text-zinc-600 hover:text-zinc-400 text-sm transition-colors"
-                      tabIndex={-1}
-                    >
-                      ✕
-                    </button>
-                  )}
-                </div>
-
-                {/* Paste button */}
-                <button
-                  onClick={pasteFromClipboard}
-                  className="shrink-0 px-3 py-3 rounded-xl border border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800 text-zinc-400 hover:text-zinc-200 text-xs font-medium transition-all duration-150"
-                  title="Paste from clipboard"
-                >
-                  📋
-                </button>
-              </div>
-
-              {/* Validation hint */}
-              {urlValid === false && (
-                <p className="mt-1.5 text-xs text-red-400 flex items-center gap-1">
-                  <span>Must be a MangaDex chapter URL or UUID</span>
-                  <span className="text-zinc-600">·</span>
-                  <a
-                    href="https://mangadex.org"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="text-zinc-500 hover:text-zinc-300 underline underline-offset-2"
-                  >
-                    mangadex.org
-                  </a>
-                </p>
-              )}
-            </div>
-
-            {/* Chapter preview card */}
-            {urlValid === true && (
-              <div className={`rounded-xl border px-4 py-3 transition-all duration-300 ${
-                previewError
-                  ? 'border-zinc-700 bg-zinc-800/30'
-                  : 'border-zinc-700 bg-zinc-800/50'
-              }`}>
-                {previewLoading ? (
-                  <div className="flex items-center gap-3">
-                    <div className="w-8 h-8 rounded-lg bg-zinc-700 animate-pulse" />
-                    <div className="space-y-1.5 flex-1">
-                      <div className="h-3 bg-zinc-700 rounded animate-pulse w-2/3" />
-                      <div className="h-2.5 bg-zinc-700 rounded animate-pulse w-1/3" />
-                    </div>
-                  </div>
-                ) : previewError ? (
-                  <p className="text-xs text-zinc-500">{previewError}</p>
-                ) : preview ? (
-                  <div className="flex items-start gap-3">
-                    <div className="w-8 h-8 rounded-lg bg-blue-900/60 border border-blue-800 flex items-center justify-center text-base shrink-0">
-                      📚
-                    </div>
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-zinc-100 truncate">{preview.mangaTitle}</p>
-                      <p className="text-xs text-zinc-500 mt-0.5">
-                        {preview.chapterNum != null ? `Chapter ${preview.chapterNum}` : 'Oneshot'}
-                        {preview.chapterTitle ? ` · ${preview.chapterTitle}` : ''}
-                        <span className="ml-2 uppercase tracking-wide text-zinc-600">{preview.language}</span>
-                      </p>
-                    </div>
-                    <span className="ml-auto shrink-0 text-green-500 text-sm">✓</span>
-                  </div>
-                ) : null}
-              </div>
-            )}
-
-            {/* Data saver toggle */}
-            <label className="flex items-center gap-3 cursor-pointer select-none group">
-              <div
-                className={`relative w-10 h-6 rounded-full transition-colors duration-200 ${
-                  dataSaver ? 'bg-blue-600' : 'bg-zinc-700'
-                }`}
-                onClick={() => setDataSaver((v) => !v)}
-              >
-                <div className={`absolute top-1 w-4 h-4 bg-white rounded-full shadow transition-transform duration-200 ${
-                  dataSaver ? 'translate-x-5' : 'translate-x-1'
-                }`} />
-              </div>
-              <span className="text-sm text-zinc-400 group-hover:text-zinc-300 transition-colors">
-                Data saver mode <span className="text-zinc-600">(lower resolution, faster)</span>
-              </span>
-            </label>
-          </div>
-        )}
-
-        {/* ── File tab ── */}
-        {tab === 'file' && (
-          <div className="space-y-4">
-            <div
-              className={`border-2 border-dashed rounded-xl p-10 text-center transition-all duration-150 cursor-pointer ${
-                dragging
-                  ? 'border-blue-500 bg-blue-950/20'
-                  : file
-                  ? 'border-green-600 bg-green-950/20'
-                  : 'border-zinc-700 hover:border-zinc-500 hover:bg-zinc-800/50'
-              }`}
-              onDragOver={(e) => { e.preventDefault(); setDragging(true) }}
-              onDragLeave={() => setDragging(false)}
-              onDrop={onDrop}
-              onClick={() => fileRef.current?.click()}
-            >
-              <input
-                ref={fileRef}
-                type="file"
-                accept=".pdf,.zip"
-                className="hidden"
-                onChange={(e) => {
-                  const f = e.target.files?.[0]
-                  if (f) { setFile(f); setError('') }
-                }}
-              />
-              {file ? (
-                <div className="space-y-2">
-                  <div className="text-3xl">
-                    {file.name.endsWith('.pdf') ? '📄' : '🗜️'}
-                  </div>
-                  <p className="font-medium text-zinc-200">{file.name}</p>
-                  <p className="text-sm text-zinc-500">
-                    {(file.size / 1024 / 1024).toFixed(1)} MB
-                    <span className="mx-1.5 text-zinc-700">·</span>
-                    <span className="uppercase text-xs tracking-wide text-zinc-600 font-medium">
-                      {file.name.split('.').pop()}
-                    </span>
-                    <span className="mx-1.5 text-zinc-700">·</span>
-                    Click to change
-                  </p>
-                </div>
-              ) : (
-                <div className="space-y-2">
-                  <div className="text-3xl text-zinc-600">📂</div>
-                  <p className="font-medium text-zinc-300">Drop your file here</p>
-                  <p className="text-sm text-zinc-600">.pdf or .zip · max 200 MB</p>
-                </div>
-              )}
-            </div>
-
-            {/* Supported format hints */}
-            <div className="flex items-center gap-3 text-xs text-zinc-600">
-              <span className="flex items-center gap-1">
-                <span className="text-sm">📄</span> PDF — single manga volume or chapter
-              </span>
-              <span className="text-zinc-800">·</span>
-              <span className="flex items-center gap-1">
-                <span className="text-sm">🗜️</span> ZIP — folder of page images
-              </span>
-            </div>
-          </div>
-        )}
-
-        {/* Error */}
-        {error && (
-          <div className="mt-4 px-4 py-3 bg-red-950/50 border border-red-800 rounded-xl text-red-400 text-sm flex items-start gap-2">
-            <span className="shrink-0 mt-0.5">⚠</span>
-            <span>{error}</span>
-          </div>
-        )}
-
-        {/* Submit */}
-        <button
-          className="btn-primary w-full mt-6 flex items-center justify-center gap-2"
-          onClick={handleSubmit}
-          disabled={loading || (tab === 'url' && urlValid === false)}
-        >
-          {loading ? (
-            <>
-              <Spinner />
-              Starting job…
-            </>
-          ) : (
-            <>
-              Translate to Hebrew
-              <span className="text-lg">→</span>
-            </>
-          )}
-        </button>
-      </div>
-
-      {/* Footer note */}
-      <p className="mt-8 text-xs text-zinc-600 text-center">
-        Powered by comic-text-detector · EasyOCR · LaMa · Gemini · python-bidi
-      </p>
     </main>
-  )
-}
-
-function Spinner() {
-  return (
-    <svg className="animate-spin h-4 w-4" viewBox="0 0 24 24" fill="none">
-      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-    </svg>
   )
 }

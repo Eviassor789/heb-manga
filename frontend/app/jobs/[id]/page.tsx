@@ -72,6 +72,7 @@ export default function JobPage() {
     usd: number; ils: number; tokens: { input: number; output: number; think: number; total: number }
   } | null>(null)
   const [modalSeconds, setModalSeconds] = useState<Record<string, number>>({})
+  const [libraryId, setLibraryId] = useState<string | null>(null)
 
   // Modal T4 effective rate — GPU ($0.59/hr) + memory overhead ≈ $1.00/hr total
   const MODAL_T4_USD_PER_SEC = 0.000277
@@ -109,8 +110,16 @@ export default function JobPage() {
           chapter?: string; total_pages?: number
           cost?: { usd: number; ils: number; tokens: { input: number; output: number; think: number; total: number } }
           modal_gpu_seconds?: number
+          library_id?: string
         }
         const { stage, status, page, total, message, download_url, total_pages } = data
+
+        // Library registration complete — show reader button
+        if (stage === 'library_ready' && data.library_id) {
+          setLibraryId(data.library_id)
+          addActivity('done', '📚 Chapter added to shared library')
+          return
+        }
         // Accumulate Gemini costs — both OCR and translate stages emit a `cost` payload
         if (data.cost) {
           const incoming = data.cost
@@ -228,6 +237,7 @@ export default function JobPage() {
     setActivity([])
     setGeminiCost(null)
     setModalSeconds({})
+    setLibraryId(null)
 
     // Reset stages from fromStep onward
     const startIdx = STAGE_ORDER.indexOf(fromStep as StageKey)
@@ -383,10 +393,25 @@ export default function JobPage() {
               </div>
             </div>
 
-            <a href={`${downloadUrl}?compressed=true`} download
-              className="btn-primary w-full flex items-center justify-center gap-2 no-underline mb-4">
-              ⬇ Download PDF
-            </a>
+            <div className="flex gap-3 mb-4">
+              <a href={`${downloadUrl}?compressed=true`} download
+                className="btn-primary flex-1 flex items-center justify-center gap-2 no-underline">
+                ⬇ Download PDF
+              </a>
+              {libraryId && (
+                <a href={`/library/${libraryId}`}
+                  className="flex-1 flex items-center justify-center gap-2 no-underline
+                             bg-green-700 hover:bg-green-600 text-white font-semibold
+                             px-4 py-3 rounded-xl transition-colors">
+                  📖 Read in Hebrew
+                </a>
+              )}
+            </div>
+            {!libraryId && done && (
+              <p className="text-xs text-zinc-600 text-center mb-4">
+                Uploading to shared library…
+              </p>
+            )}
 
             {/* Unified cost breakdown */}
             {(geminiCost || Object.keys(modalSeconds).length > 0) && (() => {

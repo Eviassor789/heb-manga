@@ -1,9 +1,10 @@
 import type { Metadata } from 'next'
 import './globals.css'
+import NavBar from '@/components/NavBar'
 
 export const metadata: Metadata = {
-  title: 'Hebrew Manga Translator',
-  description: 'Translate manga and comics to Hebrew automatically',
+  title: 'Hebrew Manga — מנגה בעברית',
+  description: 'Read manga translated to Hebrew. Powered by AI.',
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
@@ -17,7 +18,10 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
           rel="stylesheet"
         />
       </head>
-      <body className="min-h-screen">{children}</body>
+      <body className="min-h-screen">
+        <NavBar />
+        {children}
+      </body>
     </html>
   )
 }

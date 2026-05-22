@@ -18,18 +18,23 @@ from PIL import Image
 def build_compressed_pdf(
     output_dir: Path,
     dest: Path,
-    quality: int = 85,
+    quality: int = 75,          # 75 is the sweet spot for manga: ~40–50 % smaller than 85,
+                                 # line art is still crisp, only smooth gradients show any
+                                 # subtle loss. Raise to 85 if quality complaints arise.
+    max_width: int = 1500,      # Downscale pages wider than this (manga is usually 1000–1800 px).
+                                 # 1500 px is indistinguishable from the original at normal
+                                 # reading sizes while meaningfully reducing file size.
     save_pages: bool = False,
 ) -> None:
     """
     Re-encode typeset output PNGs as JPEG and assemble a PDF.
 
-    quality=85 is the sweet spot: visually identical to lossless at ~15-20 % of
-    the PNG size.  Manga line art survives 85 % JPEG quality well.
+    Combined effect of quality=75 + max_width=1500 vs the old quality=85:
+      ~7 MB  →  ~3–4 MB per chapter, still looks great in the web reader.
 
     save_pages=True also writes individual JPEGs to output_dir/pages/NNN.jpg.
-    These are later uploaded to R2 so the web reader can display pages as
-    plain <img> elements — no PDF.js or server-side streaming needed.
+    These are uploaded to R2 so the web reader can show pages as plain <img>
+    elements — no PDF.js or server-side streaming needed.
     """
     page_paths = sorted(p for p in output_dir.glob("*.png") if p.stem.isdigit())
     if not page_paths:
@@ -41,8 +46,14 @@ def build_compressed_pdf(
 
     jpeg_blobs: list[bytes] = []
     for p in page_paths:
-        img  = Image.open(p).convert("RGB")
-        buf  = io.BytesIO()
+        img = Image.open(p).convert("RGB")
+
+        # Downscale if wider than max_width (maintain aspect ratio)
+        if img.width > max_width:
+            new_height = int(img.height * max_width / img.width)
+            img = img.resize((max_width, new_height), Image.LANCZOS)
+
+        buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=quality, optimize=True, subsampling=2)
         blob = buf.getvalue()
         jpeg_blobs.append(blob)
