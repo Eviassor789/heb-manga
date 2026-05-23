@@ -132,9 +132,12 @@ export default function MangaPage() {
   const [chapLoading, setChapLoading] = useState(true)
 
   // ── UI state ──────────────────────────────────────────────────────────────
-  const [translating, setTranslating] = useState<string | null>(null)
-  const [filter,      setFilter]      = useState<'all' | 'translated' | 'untranslated'>('all')
-  const [sortDesc,    setSortDesc]    = useState(true)   // true = newest (highest ch#) first
+  const [translating,  setTranslating]  = useState<string | null>(null)
+  const [filter,       setFilter]       = useState<'all' | 'translated' | 'untranslated'>('all')
+  const [sortDesc,     setSortDesc]     = useState(true)   // true = newest (highest ch#) first
+  const [currentBatch, setCurrentBatch] = useState(0)
+
+  const BATCH_SIZE = 100
 
   // ── Phase 1: fetch manga metadata immediately ─────────────────────────────
 
@@ -196,7 +199,7 @@ export default function MangaPage() {
     }
   }, [router])
 
-  // ── Filtered + sorted chapter list ───────────────────────────────────────
+  // ── Filtered + sorted + batched chapter list ─────────────────────────────
 
   const filtered = chapters.filter(ch => {
     if (filter === 'translated')   return  libChapters.has(ch.id)
@@ -204,11 +207,47 @@ export default function MangaPage() {
     return true
   })
 
-  const sorted = [...filtered].sort((a, b) => {
+  // Always sort ascending — gives stable batches regardless of display direction
+  const filteredAsc = [...filtered].sort((a, b) => {
     const na = parseFloat(a.attributes.chapter ?? '0') || 0
     const nb = parseFloat(b.attributes.chapter ?? '0') || 0
-    return sortDesc ? nb - na : na - nb
+    return na - nb
   })
+
+  // Group by chapter NUMBER range (floor(chNum / BATCH_SIZE)) so that
+  // chapter 48.5 lands in the same batch as 48, not counted separately.
+  function getChBatch(numStr: string | null): number {
+    return Math.floor((parseFloat(numStr ?? '0') || 0) / BATCH_SIZE)
+  }
+
+  // All distinct batch-number values present in filteredAsc, ascending
+  const allBatchNums = [...new Set(filteredAsc.map(ch => getChBatch(ch.attributes.chapter)))].sort((a, b) => a - b)
+  const totalBatches = allBatchNums.length
+
+  // Label: always "N*100+1 – (N+1)*100" regardless of actual chapter numbers in the batch
+  function batchLabel(batchIdx: number): string {
+    const n = allBatchNums[batchIdx]
+    return `${n * BATCH_SIZE + 1}–${(n + 1) * BATCH_SIZE}`
+  }
+
+  const activeBatchNum = allBatchNums[currentBatch] ?? 0
+  const batchSlice = filteredAsc.filter(ch => getChBatch(ch.attributes.chapter) === activeBatchNum)
+  const sorted = sortDesc ? [...batchSlice].reverse() : batchSlice
+
+  // Default to LAST batch (newest) whenever filter, sort, or chapter data changes
+  useEffect(() => {
+    const batchNums = new Set(
+      chapters
+        .filter(ch => {
+          if (filter === 'translated')   return  libChapters.has(ch.id)
+          if (filter === 'untranslated') return !libChapters.has(ch.id)
+          return true
+        })
+        .map(ch => getChBatch(ch.attributes.chapter))
+    )
+    setCurrentBatch(Math.max(0, batchNums.size - 1))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, sortDesc, chapters.length, libChapters.size])
 
   // ── Render: loading phase 1 ───────────────────────────────────────────────
 
@@ -243,14 +282,6 @@ export default function MangaPage() {
 
   return (
     <main className="min-h-screen px-4 py-8 max-w-5xl mx-auto animate-fade-in">
-
-      {/* Back */}
-      <Link
-        href="/discover"
-        className="text-zinc-500 hover:text-[var(--accent)] text-sm transition-colors mb-6 inline-flex items-center gap-1"
-      >
-        ← Discover
-      </Link>
 
       {/* ── Manga header — shown immediately ── */}
       <div className="flex gap-6 mb-10 flex-col sm:flex-row">
@@ -310,13 +341,35 @@ export default function MangaPage() {
         </div>
       </div>
 
-      {/* ── Chapter list — loads separately ── */}
-      <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
-        <h2 className="text-lg font-bold text-zinc-100">Chapters</h2>
+      {/* ── Chapter list header + controls ── */}
+      <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
 
+        {/* Left: title + batch chips (max 60% so chips never crowd the filters) */}
+        <div className="flex-1 min-w-0" style={{ maxWidth: '60%' }}>
+          <h2 className="text-lg font-bold text-zinc-100 mb-2">Chapters</h2>
+          {!chapLoading && totalBatches > 1 && (
+            <div className="flex flex-wrap gap-1.5">
+              {Array.from({ length: totalBatches }).map((_, i) => (
+                <button
+                  key={i}
+                  onClick={() => setCurrentBatch(i)}
+                  className="px-2.5 py-1 rounded-lg text-xs font-medium transition-all"
+                  style={
+                    i === currentBatch
+                      ? { background: 'var(--accent)', color: '#fff' }
+                      : { background: 'var(--card-bg)', border: '1px solid var(--card-border)', color: '#71717a' }
+                  }
+                >
+                  {batchLabel(i)}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Right: filter + sort toggles — always anchored to the right */}
         {!chapLoading && (
-          <div className="flex items-center gap-2 flex-wrap">
-            {/* Filter toggle */}
+          <div className="flex items-center gap-2 flex-wrap shrink-0" style={{ margin: 'auto', marginBottom: '0px', marginRight: '0px' }}>
             <div
               className="flex items-center gap-1 p-1 rounded-xl text-xs"
               style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}
@@ -334,8 +387,6 @@ export default function MangaPage() {
                 </button>
               ))}
             </div>
-
-            {/* Sort toggle */}
             <button
               onClick={() => setSortDesc(d => !d)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
@@ -350,7 +401,7 @@ export default function MangaPage() {
 
       {/* Loading skeleton while chapters are fetched */}
       {chapLoading && (
-        <div className="card overflow-hidden">
+        <div className="rounded-2xl overflow-hidden" style={{ background: 'var(--card-bg)' }}>
           {Array.from({ length: 6 }).map((_, i) => (
             <div
               key={i}
@@ -369,7 +420,7 @@ export default function MangaPage() {
 
       {/* Chapter rows */}
       {!chapLoading && (
-        <div className="card divide-y divide-zinc-800/40 overflow-hidden">
+        <div className="rounded-2xl divide-y divide-zinc-800/40 overflow-hidden" style={{ background: 'var(--card-bg)' }}>
           {sorted.length === 0 && (
             <div className="px-5 py-10 text-center text-zinc-500 text-sm">
               {chapters.length === 0

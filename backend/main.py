@@ -701,11 +701,28 @@ async def weebcentral_series_info(series_id: str):
                    or soup.find("meta", attrs={"name": "description"}))
         description = og_desc.get("content", "").strip() if og_desc else ""
 
+    # Tags — look for <strong>Tag(s)</strong> and collect the <a> links nearby.
+    # WC links look like: href="https://weebcentral.com/search?included_tag=Action"
+    tags: list[str] = []
+    for strong in soup.find_all("strong"):
+        txt = strong.get_text(strip=True).lower()
+        if "tag" in txt:
+            parent = strong.parent  # usually a <li> or <div>
+            container = parent if parent else strong
+            for link in container.find_all("a", href=True):
+                href = link.get("href", "")
+                if "included_tag" in href or "tag" in href.lower():
+                    tag_name = link.get_text(strip=True)
+                    if tag_name and tag_name not in tags:
+                        tags.append(tag_name)
+            break
+
     return {
         "id":          series_id,
         "title":       title,
         "cover":       cover,
         "description": description,
+        "tags":        tags,
         "url":         f"https://weebcentral.com/series/{series_id}",
     }
 

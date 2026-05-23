@@ -12,6 +12,7 @@ interface WCSeriesInfo {
   title:       string
   cover:       string
   description: string
+  tags:        string[]
   url:         string
 }
 
@@ -51,6 +52,8 @@ export default function WeebCentralMangaPage() {
   const [sortDesc,     setSortDesc]     = useState(true)   // true = newest (highest ch#) first
   const [filter,       setFilter]       = useState<'all' | 'translated' | 'untranslated'>('all')
   const [translating,  setTranslating]  = useState<string | null>(null)
+  const [currentBatch, setCurrentBatch] = useState(0)
+  const BATCH_SIZE = 100
 
   // ── Phase 1: fetch series metadata ──────────────────────────────────────
 
@@ -120,20 +123,55 @@ export default function WeebCentralMangaPage() {
     }
   }, [router])
 
-  // ── Sorted chapter list ──────────────────────────────────────────────────
+  // ── Batch-aware chapter list ──────────────────────────────────────────────
 
-  const sorted = [...chapters]
-    .sort((a, b) => {
-      const na = parseFloat(a.number || '0') || 0
-      const nb = parseFloat(b.number || '0') || 0
-      return sortDesc ? nb - na : na - nb
-    })
-    .filter(ch => {
-      const translated = !!(libMap.get(ch.number) ?? libMap.get(ch.id))
-      if (filter === 'translated')   return  translated
-      if (filter === 'untranslated') return !translated
-      return true
-    })
+  // Filter first
+  const filtered = chapters.filter(ch => {
+    const translated = !!(libMap.get(ch.number) ?? libMap.get(ch.id))
+    if (filter === 'translated')   return  translated
+    if (filter === 'untranslated') return !translated
+    return true
+  })
+
+  // Always sort ascending — gives stable batches regardless of display direction
+  const filteredAsc = [...filtered].sort((a, b) => {
+    const na = parseFloat(a.number || '0') || 0
+    const nb = parseFloat(b.number || '0') || 0
+    return na - nb
+  })
+
+  // Group by chapter NUMBER range so that 48.5 falls in the same batch as 48
+  function getChBatch(numStr: string): number {
+    return Math.floor((parseFloat(numStr || '0') || 0) / BATCH_SIZE)
+  }
+
+  const allBatchNums = [...new Set(filteredAsc.map(ch => getChBatch(ch.number)))].sort((a, b) => a - b)
+  const totalBatches = allBatchNums.length
+
+  function batchLabel(batchIdx: number): string {
+    const n = allBatchNums[batchIdx]
+    return `${n * BATCH_SIZE + 1}–${(n + 1) * BATCH_SIZE}`
+  }
+
+  const activeBatchNum = allBatchNums[currentBatch] ?? 0
+  const batchSlice = filteredAsc.filter(ch => getChBatch(ch.number) === activeBatchNum)
+  const sorted = sortDesc ? [...batchSlice].reverse() : batchSlice
+
+  // Default to LAST batch (newest) when filter / sort / data changes
+  useEffect(() => {
+    const batchNums = new Set(
+      chapters
+        .filter(ch => {
+          const translated = !!(libMap.get(ch.number) ?? libMap.get(ch.id))
+          if (filter === 'translated')   return  translated
+          if (filter === 'untranslated') return !translated
+          return true
+        })
+        .map(ch => getChBatch(ch.number))
+    )
+    setCurrentBatch(Math.max(0, batchNums.size - 1))
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filter, sortDesc, chapters.length, libMap.size])
 
   const translatedCount = chapters.filter(ch =>
     !!(libMap.get(ch.number) ?? libMap.get(ch.id))
@@ -166,14 +204,6 @@ export default function WeebCentralMangaPage() {
   return (
     <main className="min-h-screen px-4 py-8 max-w-5xl mx-auto animate-fade-in">
 
-      {/* Back */}
-      <Link
-        href="/discover"
-        className="text-zinc-500 hover:text-[var(--accent)] text-sm transition-colors mb-6 inline-flex items-center gap-1"
-      >
-        ← Discover
-      </Link>
-
       {/* ── Series header ── */}
       <div className="flex gap-6 mb-10 flex-col sm:flex-row">
         {/* Cover */}
@@ -201,9 +231,31 @@ export default function WeebCentralMangaPage() {
           </h1>
 
           {series.description && (
-            <p className="text-zinc-400 text-sm leading-relaxed line-clamp-4 mb-4">
+            <p className="text-zinc-400 text-sm leading-relaxed line-clamp-4 mb-3">
               {series.description}
             </p>
+          )}
+
+          {/* Genre tags */}
+          {series.tags && series.tags.length > 0 && (
+            <div className="flex flex-wrap gap-1.5 mb-4">
+              {series.tags.map(tag => (
+                <a
+                  key={tag}
+                  href={`https://weebcentral.com/search?included_tag=${encodeURIComponent(tag)}`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="text-xs font-medium px-2 py-0.5 rounded-md transition-colors hover:text-white"
+                  style={{
+                    background:  'rgba(10,5,20,0.7)',
+                    border:      '1px solid rgba(139,92,246,0.3)',
+                    color:       '#a78bfa',
+                  }}
+                >
+                  {tag}
+                </a>
+              ))}
+            </div>
           )}
 
           <div className="flex flex-wrap gap-3 text-sm">
@@ -231,13 +283,35 @@ export default function WeebCentralMangaPage() {
         </div>
       </div>
 
-      {/* ── Chapter list header ── */}
-      <div className="flex items-center justify-between gap-3 mb-4 flex-wrap">
-        <h2 className="text-lg font-bold text-zinc-100">Chapters</h2>
+      {/* ── Chapter list header + controls ── */}
+      <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
 
+        {/* Left: title + batch chips (capped at 60% so chips never crowd the filters) */}
+        <div className="flex-1 min-w-0" style={{ maxWidth: '60%' }}>
+          <h2 className="text-lg font-bold text-zinc-100 mb-2">Chapters</h2>
+          {!chapLoading && totalBatches > 1 && (
+            <div className="flex flex-wrap gap-1.5">
+              {Array.from({ length: totalBatches }).map((_, i) => (
+                <button
+                  key={i}
+                  onClick={() => setCurrentBatch(i)}
+                  className="px-2.5 py-1 rounded-lg text-xs font-medium transition-all"
+                  style={
+                    i === currentBatch
+                      ? { background: 'var(--accent)', color: '#fff' }
+                      : { background: 'var(--card-bg)', border: '1px solid var(--card-border)', color: '#71717a' }
+                  }
+                >
+                  {batchLabel(i)}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* Right: filter + sort — always anchored to the right */}
         {!chapLoading && chapters.length > 0 && (
-          <div className="flex items-center gap-2 flex-wrap">
-            {/* Filter toggle — same as MangaDex page */}
+          <div className="flex items-center gap-2 flex-wrap shrink-0" style={{ margin: 'auto', marginBottom: '0px', marginRight: '0px' }}>
             <div
               className="flex items-center gap-1 p-1 rounded-xl text-xs"
               style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}
@@ -255,8 +329,6 @@ export default function WeebCentralMangaPage() {
                 </button>
               ))}
             </div>
-
-            {/* Sort toggle */}
             <button
               onClick={() => setSortDesc(d => !d)}
               className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
@@ -271,7 +343,7 @@ export default function WeebCentralMangaPage() {
 
       {/* Loading skeleton */}
       {chapLoading && (
-        <div className="card overflow-hidden">
+        <div className="rounded-2xl overflow-hidden" style={{ background: 'var(--card-bg)' }}>
           {Array.from({ length: 6 }).map((_, i) => (
             <div
               key={i}
@@ -290,7 +362,7 @@ export default function WeebCentralMangaPage() {
 
       {/* Chapter rows */}
       {!chapLoading && (
-        <div className="card divide-y divide-zinc-800/40 overflow-hidden">
+        <div className="rounded-2xl divide-y divide-zinc-800/40 overflow-hidden" style={{ background: 'var(--card-bg)' }}>
           {sorted.length === 0 && (
             <div className="px-5 py-10 text-center text-zinc-500 text-sm">
               {chapters.length === 0

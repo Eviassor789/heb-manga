@@ -164,6 +164,29 @@ export default function ReaderPage() {
       .catch(err  => { setError(err.message); setLoading(false) })
   }, [id])
 
+  // ── Persist reading progress to localStorage (for "Continue Reading" row) ──
+
+  useEffect(() => {
+    if (!chapter || !id) return
+    try {
+      const entry = {
+        manga_id:    chapter.manga_id ?? id,
+        manga_title: chapter.manga_title,
+        cover_url:   chapter.cover_url ?? null,
+        chapter_id:  id,
+        chapter_num: chapter.chapter_num ?? null,
+        last_read:   new Date().toISOString(),
+      }
+      const raw      = localStorage.getItem('hemanga-continue-reading') ?? '[]'
+      const prev     = JSON.parse(raw) as typeof entry[]
+      const filtered = prev.filter(e => e.manga_id !== entry.manga_id)
+      localStorage.setItem(
+        'hemanga-continue-reading',
+        JSON.stringify([entry, ...filtered].slice(0, 20)),
+      )
+    } catch { /* localStorage unavailable — ignore */ }
+  }, [currentPage, chapter, id])
+
   // ── Intersection observer → track visible page (TTB only) ─────────────────
 
   useEffect(() => {

@@ -70,7 +70,7 @@ function DiscoverContent() {
 
   // URL is the source of truth for what's actually been searched
   const urlQ   = searchParams.get('q')   ?? ''
-  const urlSrc = (searchParams.get('src') ?? 'mangadex') as Source
+  const urlSrc = (searchParams.get('src') ?? 'weebcentral') as Source
 
   // Local UI state — input value (can differ from urlQ while user is typing)
   const [inputValue, setInputValue] = useState(urlQ)
@@ -168,7 +168,7 @@ function DiscoverContent() {
     if (!q.trim()) return
     const params = new URLSearchParams()
     params.set('q', q.trim())
-    if (src !== 'mangadex') params.set('src', src)
+    if (src !== 'weebcentral') params.set('src', src)
     router.push(`/discover?${params.toString()}`)
   }, [router])
 
@@ -177,7 +177,7 @@ function DiscoverContent() {
   const switchSource = useCallback((s: Source) => {
     const params = new URLSearchParams()
     if (urlQ) params.set('q', urlQ)
-    if (s !== 'mangadex') params.set('src', s)
+    if (s !== 'weebcentral') params.set('src', s)
     const qs = params.toString()
     router.replace(`/discover${qs ? `?${qs}` : ''}`)
   }, [router, urlQ])
@@ -187,7 +187,7 @@ function DiscoverContent() {
   const clearSearch = useCallback(() => {
     setInputValue('')
     const params = new URLSearchParams()
-    if (urlSrc !== 'mangadex') params.set('src', urlSrc)
+    if (urlSrc !== 'weebcentral') params.set('src', urlSrc)
     const qs = params.toString()
     router.push(`/discover${qs ? `?${qs}` : ''}`)
     inputRef.current?.focus()
@@ -218,7 +218,7 @@ function DiscoverContent() {
 
       {/* Source toggle */}
       <div className="flex gap-1 bg-zinc-900/60 border border-[var(--card-border)] p-1 rounded-xl mb-5 w-fit">
-        {(['mangadex', 'weebcentral'] as const).map(s => (
+        {(['weebcentral', 'mangadex'] as const).map(s => (
           <button
             key={s}
             onClick={() => switchSource(s)}
