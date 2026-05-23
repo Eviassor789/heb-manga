@@ -299,29 +299,59 @@ def nms_regions(regions: list[dict], iou_threshold: float = _NMS_IOU_THRESHOLD) 
     """
     Remove near-duplicate regions produced by the detector.
 
-    Handles two distinct cases:
+    Handles three distinct cases:
 
     Case A — same bubble detected twice (IoU ≈ 0.95, boxes nearly identical):
         Caught by the IoU threshold (0.45).
 
-    Case B — connected/adjacent bubbles where the detector fires one large box
-        covering both AND a smaller box covering just one (as happens with
-        partially-joined manga speech clouds).  IoU is low (~0.25) because the
-        large box is much bigger, so plain IoU misses this.  Caught by the
-        containment check: if ≥ 75 % of the candidate is already inside a
-        larger kept region, it is redundant and suppressed.
+    Case B — connected/adjacent bubbles where the detector fires one large
+        merged box covering both AND smaller individual boxes for each one.
+        Caught by the first pass: the merged box is identified as a "merger"
+        (it substantially contains ≥ 2 smaller candidates) and discarded in
+        favour of the more precise individual boxes.
 
-    Sort order: (confidence DESC, area DESC) so larger / higher-confidence
-    boxes win when there is a tie.  This guarantees that when two boxes overlap
-    heavily, the bigger one (which has more complete text) is kept.
+    Case C — connected/adjacent bubbles where the detector ONLY fires the
+        merged box (no individual sub-boxes).  We cannot split it further here,
+        so it is kept as-is.  The typesetter will render the combined text in
+        the merged bbox — imperfect but not worse than before.
+
+    Sort order: (confidence DESC, area DESC) so higher-confidence / larger
+    boxes are considered first in the second NMS pass.
     """
     sorted_r = sorted(
         regions,
         key=lambda r: (r.get("confidence", 0.0), _area(r["bbox"])),
         reverse=True,
     )
+    n = len(sorted_r)
+
+    # ── Pass 1: identify "merger" boxes ───────────────────────────────────────
+    # A box is a merger if it substantially contains 2+ meaningfully smaller
+    # candidates.  When we have both the merged box and the individual boxes,
+    # we prefer the individual ones (finer granularity = better text placement).
+    merger_indices: set[int] = set()
+    for i in range(n):
+        bbox_i  = sorted_r[i]["bbox"]
+        area_i  = _area(bbox_i)
+        if area_i == 0:
+            continue
+        # Count candidates that are (a) significantly smaller and
+        # (b) mostly inside this box.
+        children = [
+            j for j in range(n)
+            if j != i
+            and _area(sorted_r[j]["bbox"]) < area_i * 0.85     # meaningfully smaller
+            and _containment(sorted_r[j]["bbox"], bbox_i) > 0.75  # mostly inside
+        ]
+        if len(children) >= 2:
+            merger_indices.add(i)
+
+    # ── Pass 2: standard NMS skipping identified merger boxes ─────────────────
     kept: list[dict] = []
-    for candidate in sorted_r:
+    for i, candidate in enumerate(sorted_r):
+        if i in merger_indices:
+            continue  # prefer the individual children detected for this region
+
         bbox_c = candidate["bbox"]
         suppress = False
         for k in kept:

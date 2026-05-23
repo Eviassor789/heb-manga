@@ -12,6 +12,9 @@ const LINKS = [
 export default function NavBar() {
   const pathname = usePathname()
 
+  // Full-screen reader: hide the global nav entirely
+  if (pathname.startsWith('/library/')) return null
+
   return (
     <nav className="sticky top-0 z-40 backdrop-blur-md border-b border-[var(--card-border)] bg-[rgba(9,9,15,0.88)]">
       <div className="max-w-6xl mx-auto px-4 h-14 flex items-center justify-between gap-6">

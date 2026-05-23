@@ -1,6 +1,7 @@
 'use client'
 
-import { useEffect, useRef, useState } from 'react'
+import { Suspense, useCallback, useEffect, useRef, useState } from 'react'
+import { useRouter, useSearchParams } from 'next/navigation'
 import MangaCard from '@/components/MangaCard'
 import SkeletonCard from '@/components/SkeletonCard'
 import Spinner from '@/components/Spinner'
@@ -31,8 +32,8 @@ interface WCManga {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-const MD_API = 'https://api.mangadex.org'
-const ALL_RATINGS = ['safe', 'suggestive', 'erotica']  // fix: includes all ratings
+const MD_API    = 'https://api.mangadex.org'
+const ALL_RATINGS = ['safe', 'suggestive', 'erotica']
 
 function getMangaTitle(m: MDManga): string {
   const t = m.attributes.title
@@ -57,32 +58,38 @@ async function fetchMangaDex(extra: Record<string, string>): Promise<MDManga[]> 
   return (await res.json()).data ?? []
 }
 
-// ── Component ──────────────────────────────────────────────────────────────────
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 type Source = 'mangadex' | 'weebcentral'
 
-export default function DiscoverPage() {
-  const [source,        setSource]        = useState<Source>('mangadex')
-  const [query,         setQuery]         = useState('')
+// ── Inner component (needs useSearchParams → must be inside Suspense) ──────────
 
-  // MangaDex
+function DiscoverContent() {
+  const router       = useRouter()
+  const searchParams = useSearchParams()
+
+  // URL is the source of truth for what's actually been searched
+  const urlQ   = searchParams.get('q')   ?? ''
+  const urlSrc = (searchParams.get('src') ?? 'mangadex') as Source
+
+  // Local UI state — input value (can differ from urlQ while user is typing)
+  const [inputValue, setInputValue] = useState(urlQ)
+
+  // MangaDex state
   const [mdFeatured,    setMdFeatured]    = useState<MDManga[]>([])
   const [mdResults,     setMdResults]     = useState<MDManga[]>([])
   const [mdFeatLoading, setMdFeatLoading] = useState(true)
   const [mdSrchLoading, setMdSrchLoading] = useState(false)
 
-  // WeebCentral
+  // WeebCentral state
   const [wcFeatured,    setWcFeatured]    = useState<WCManga[]>([])
   const [wcResults,     setWcResults]     = useState<WCManga[]>([])
   const [wcFeatLoading, setWcFeatLoading] = useState(false)
   const [wcFeatLoaded,  setWcFeatLoaded]  = useState(false)
   const [wcSrchLoading, setWcSrchLoading] = useState(false)
 
-  const [error,         setError]         = useState<string | null>(null)
-  const [inLibrary,     setInLibrary]     = useState<Set<string>>(new Set())
-  // Track whether user has actually submitted a search (Enter / button)
-  // so typing alone never hides the featured grid.
-  const [hasSearched,   setHasSearched]   = useState(false)
+  const [error,     setError]     = useState<string | null>(null)
+  const [inLibrary, setInLibrary] = useState<Set<string>>(new Set())
 
   const inputRef = useRef<HTMLInputElement>(null)
 
@@ -91,16 +98,13 @@ export default function DiscoverPage() {
   useEffect(() => {
     fetch('/api/library')
       .then(r => r.json())
-      .then(data => {
-        const ids = new Set<string>(
-          (data.chapters ?? []).map((c: { manga_id: string }) => c.manga_id)
-        )
-        setInLibrary(ids)
-      })
+      .then(data => setInLibrary(new Set(
+        (data.chapters ?? []).map((c: { manga_id: string }) => c.manga_id)
+      )))
       .catch(() => {})
   }, [])
 
-  // ── MangaDex popular (load once on mount) ────────────────────────────────
+  // ── MangaDex popular (load once) ─────────────────────────────────────────
 
   useEffect(() => {
     fetchMangaDex({ 'order[followedCount]': 'desc' })
@@ -109,101 +113,117 @@ export default function DiscoverPage() {
       .finally(() => setMdFeatLoading(false))
   }, [])
 
-  // ── WeebCentral featured (load when tab is first activated) ──────────────
+  // ── WeebCentral featured (load when tab first activated) ─────────────────
 
   useEffect(() => {
-    if (source !== 'weebcentral' || wcFeatLoaded) return
+    if (urlSrc !== 'weebcentral' || wcFeatLoaded) return
     setWcFeatLoading(true)
     fetch('/api/weebcentral/featured')
       .then(r => r.json())
       .then(d => setWcFeatured(d.results ?? []))
-      .catch(() => {/* silently ignore — empty state shows instead */})
+      .catch(() => {})
       .finally(() => { setWcFeatLoading(false); setWcFeatLoaded(true) })
-  }, [source, wcFeatLoaded])
+  }, [urlSrc, wcFeatLoaded])
 
-  // ── Search (triggered by Enter / button, NOT on every keystroke) ─────────
+  // ── React to URL param changes (back/forward nav + initial load) ──────────
+  // This is the single place that actually runs searches.
 
-  const runSearch = async (q: string, src: Source) => {
-    if (!q.trim()) return
-    setHasSearched(true)
+  const prevParamsRef = useRef('')
 
-    if (src === 'mangadex') {
+  useEffect(() => {
+    const key = `${urlQ}|${urlSrc}`
+    if (key === prevParamsRef.current) return   // nothing changed
+    prevParamsRef.current = key
+
+    // Sync input to URL value (restores the search term when pressing Back)
+    setInputValue(urlQ)
+
+    if (!urlQ.trim()) {
+      // No query — clear results and show featured
+      setMdResults([])
+      setWcResults([])
+      return
+    }
+
+    // Run the search for whatever the URL says
+    if (urlSrc === 'mangadex') {
       setMdSrchLoading(true)
-      try {
-        setMdResults(await fetchMangaDex({ title: q, 'order[relevance]': 'desc' }))
-      } catch {
-        setMdResults([])
-      } finally {
-        setMdSrchLoading(false)
-      }
+      fetchMangaDex({ title: urlQ, 'order[relevance]': 'desc' })
+        .then(setMdResults)
+        .catch(() => setMdResults([]))
+        .finally(() => setMdSrchLoading(false))
     } else {
       setWcSrchLoading(true)
-      try {
-        const res = await fetch(`/api/search/weebcentral?q=${encodeURIComponent(q)}`)
-        setWcResults((await res.json()).results ?? [])
-      } catch {
-        setWcResults([])
-      } finally {
-        setWcSrchLoading(false)
-      }
+      fetch(`/api/search/weebcentral?q=${encodeURIComponent(urlQ)}`)
+        .then(r => r.json())
+        .then(d => setWcResults(d.results ?? []))
+        .catch(() => setWcResults([]))
+        .finally(() => setWcSrchLoading(false))
     }
-  }
+  }, [urlQ, urlSrc])
 
-  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') runSearch(query, source)
-  }
+  // ── Push a new search to the URL (becomes a history entry → Back restores it) ──
 
-  const handleSearchBtn = () => runSearch(query, source)
+  const commitSearch = useCallback((q: string, src: Source) => {
+    if (!q.trim()) return
+    const params = new URLSearchParams()
+    params.set('q', q.trim())
+    if (src !== 'mangadex') params.set('src', src)
+    router.push(`/discover?${params.toString()}`)
+  }, [router])
 
-  const clearSearch = () => {
-    setQuery('')
-    setMdResults([])
-    setWcResults([])
-    setHasSearched(false)  // go back to showing featured
+  // ── Switch source tab (replace history — not a meaningful navigation step) ──
+
+  const switchSource = useCallback((s: Source) => {
+    const params = new URLSearchParams()
+    if (urlQ) params.set('q', urlQ)
+    if (s !== 'mangadex') params.set('src', s)
+    const qs = params.toString()
+    router.replace(`/discover${qs ? `?${qs}` : ''}`)
+  }, [router, urlQ])
+
+  // ── Clear search ───────────────────────────────────────────────────────────
+
+  const clearSearch = useCallback(() => {
+    setInputValue('')
+    const params = new URLSearchParams()
+    if (urlSrc !== 'mangadex') params.set('src', urlSrc)
+    const qs = params.toString()
+    router.push(`/discover${qs ? `?${qs}` : ''}`)
     inputRef.current?.focus()
-  }
+  }, [router, urlSrc])
 
-  const handleSourceSwitch = (s: Source) => {
-    setSource(s)
-    setMdResults([])
-    setWcResults([])
-    setHasSearched(false)  // always show featured when switching tabs
-  }
+  // ── Derived ───────────────────────────────────────────────────────────────
 
-  // ── Derived state ─────────────────────────────────────────────────────────
+  const hasSearched = !!urlQ.trim()
 
-  const isSearching = query.trim().length > 0
-  const hasResults  = source === 'mangadex' ? mdResults.length > 0 : wcResults.length > 0
-
-  const isLoading = source === 'mangadex'
+  const isLoading = urlSrc === 'mangadex'
     ? (hasSearched ? mdSrchLoading : mdFeatLoading)
     : (hasSearched ? wcSrchLoading : wcFeatLoading)
 
-  // Show search results only after the user explicitly submits a search.
-  // While typing, keep showing the featured grid unchanged.
-  const displayList: (MDManga | WCManga)[] = source === 'mangadex'
+  const displayList: (MDManga | WCManga)[] = urlSrc === 'mangadex'
     ? (hasSearched ? mdResults : mdFeatured)
     : (hasSearched ? wcResults : wcFeatured)
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render ─────────────────────────────────────────────────────────────────
 
   return (
     <main className="min-h-screen px-4 py-8 max-w-6xl mx-auto animate-fade-in">
 
-      {/* ── Header ── */}
+      {/* Header */}
       <div className="mb-6">
         <h1 className="text-3xl font-bold text-zinc-50 mb-1">Discover Manga</h1>
         <p className="text-zinc-500 text-sm">Find a manga and translate a chapter to Hebrew</p>
       </div>
 
-      {/* ── Source toggle ── */}
+      {/* Source toggle */}
       <div className="flex gap-1 bg-zinc-900/60 border border-[var(--card-border)] p-1 rounded-xl mb-5 w-fit">
         {(['mangadex', 'weebcentral'] as const).map(s => (
           <button
             key={s}
-            onClick={() => handleSourceSwitch(s)}
+            onClick={() => switchSource(s)}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition-all duration-150 ${
-              source === s
+              urlSrc === s
                 ? 'bg-[var(--accent)] text-white shadow'
                 : 'text-zinc-500 hover:text-zinc-200'
             }`}
@@ -213,10 +233,9 @@ export default function DiscoverPage() {
         ))}
       </div>
 
-      {/* ── Search bar with button ── */}
+      {/* Search bar */}
       <div className="relative mb-8 flex gap-2">
         <div className="relative flex-1">
-          {/* Spinner or icon inside the input */}
           <div className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none">
             🔍
           </div>
@@ -224,16 +243,16 @@ export default function DiscoverPage() {
             ref={inputRef}
             className="input pl-11 pr-10 text-base"
             placeholder={
-              source === 'mangadex'
+              urlSrc === 'mangadex'
                 ? 'Search MangaDex… (Enter to search)'
                 : 'Search WeebCentral… (Enter to search)'
             }
-            value={query}
-            onChange={e => setQuery(e.target.value)}
-            onKeyDown={handleKeyDown}
+            value={inputValue}
+            onChange={e => setInputValue(e.target.value)}
+            onKeyDown={e => { if (e.key === 'Enter') commitSearch(inputValue, urlSrc) }}
             autoFocus
           />
-          {query && (
+          {inputValue && (
             <button
               onClick={clearSearch}
               className="absolute right-4 top-1/2 -translate-y-1/2 text-zinc-500 hover:text-zinc-300 transition-colors"
@@ -244,51 +263,50 @@ export default function DiscoverPage() {
           )}
         </div>
 
-        {/* Search button */}
         <button
-          onClick={handleSearchBtn}
-          disabled={!query.trim() || isLoading}
+          onClick={() => commitSearch(inputValue, urlSrc)}
+          disabled={!inputValue.trim() || isLoading}
           className="btn-primary px-5 flex items-center gap-2 shrink-0"
         >
-          {isLoading && isSearching ? <Spinner size="sm" /> : null}
+          {isLoading && hasSearched ? <Spinner size="sm" /> : null}
           Search
         </button>
       </div>
 
-      {/* ── Section label ── */}
+      {/* Section label */}
       <h2 className="text-xs font-semibold text-zinc-500 uppercase tracking-widest mb-4">
-        {hasSearched && (displayList as WCManga[]).length > 0
-          ? `Results for "${query}"`
-          : hasSearched && (displayList as WCManga[]).length === 0 && !isLoading
+        {hasSearched && displayList.length > 0 && !isLoading
+          ? `Results for "${urlQ}"`
+          : hasSearched && displayList.length === 0 && !isLoading
           ? 'No results'
-          : source === 'mangadex'
+          : urlSrc === 'mangadex'
           ? 'Popular on MangaDex'
           : 'Hot Updates on WeebCentral'}
       </h2>
 
-      {/* ── Error ── */}
-      {error && source === 'mangadex' && (
+      {/* Error */}
+      {error && urlSrc === 'mangadex' && !hasSearched && (
         <div className="card p-6 text-center text-red-400 text-sm">{error}</div>
       )}
 
-      {/* ── Loading skeletons ── */}
+      {/* Loading skeletons */}
       {isLoading && (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
           {Array.from({ length: 12 }).map((_, i) => <SkeletonCard key={i} />)}
         </div>
       )}
 
-      {/* ── No results (only shown after an actual search) ── */}
+      {/* No results */}
       {!isLoading && hasSearched && displayList.length === 0 && (
         <div className="text-center py-16 text-zinc-500">
           No manga found for{' '}
-          <span className="text-zinc-300">&ldquo;{query}&rdquo;</span>{' '}
-          on {source === 'mangadex' ? 'MangaDex' : 'WeebCentral'}
+          <span className="text-zinc-300">&ldquo;{urlQ}&rdquo;</span>{' '}
+          on {urlSrc === 'mangadex' ? 'MangaDex' : 'WeebCentral'}
         </div>
       )}
 
-      {/* ── MangaDex grid ── */}
-      {source === 'mangadex' && !isLoading && (displayList as MDManga[]).length > 0 && (
+      {/* MangaDex grid */}
+      {urlSrc === 'mangadex' && !isLoading && (displayList as MDManga[]).length > 0 && (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
           {(displayList as MDManga[]).map(m => (
             <MangaCard
@@ -303,8 +321,8 @@ export default function DiscoverPage() {
         </div>
       )}
 
-      {/* ── WeebCentral grid — links to our /weebcentral/[id] page ── */}
-      {source === 'weebcentral' && !isLoading && (displayList as WCManga[]).length > 0 && (
+      {/* WeebCentral grid */}
+      {urlSrc === 'weebcentral' && !isLoading && (displayList as WCManga[]).length > 0 && (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
           {(displayList as WCManga[]).map(m => (
             <MangaCard
@@ -312,13 +330,32 @@ export default function DiscoverPage() {
               href={`/weebcentral/${m.id}`}
               title={m.title}
               coverUrl={m.cover || null}
-              badge="WeebCentral"
-              badgeColor="violet"
+              badge={inLibrary.has(m.id) ? '✓ In Library' : undefined}
+              badgeColor="green"
             />
           ))}
         </div>
       )}
 
     </main>
+  )
+}
+
+// ── Page export — wraps in Suspense because useSearchParams requires it ────────
+
+export default function DiscoverPage() {
+  return (
+    <Suspense
+      fallback={
+        <main className="min-h-screen flex items-center justify-center">
+          <div className="flex items-center gap-3 text-zinc-500">
+            <Spinner size="lg" />
+            <span>Loading…</span>
+          </div>
+        </main>
+      }
+    >
+      <DiscoverContent />
+    </Suspense>
   )
 }

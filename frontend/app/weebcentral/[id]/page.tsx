@@ -22,6 +22,13 @@ interface WCChapter {
   url:    string
 }
 
+interface LibraryEntry {
+  id:           string   // library UUID  → /library/{id}
+  mangadex_id:  string   // "wc:ULID"
+  chapter_num:  string
+  chapter_title: string
+}
+
 // ── Component ──────────────────────────────────────────────────────────────────
 
 export default function WeebCentralMangaPage() {
@@ -37,8 +44,12 @@ export default function WeebCentralMangaPage() {
   const [chapters,     setChapters]     = useState<WCChapter[]>([])
   const [chapLoading,  setChapLoading]  = useState(true)
 
+  // Phase 3: library (translated chapters)
+  const [libMap,       setLibMap]       = useState<Map<string, LibraryEntry>>(new Map())
+
   // UI state
   const [sortDesc,     setSortDesc]     = useState(true)   // true = newest (highest ch#) first
+  const [filter,       setFilter]       = useState<'all' | 'translated' | 'untranslated'>('all')
   const [translating,  setTranslating]  = useState<string | null>(null)
 
   // ── Phase 1: fetch series metadata ──────────────────────────────────────
@@ -65,6 +76,30 @@ export default function WeebCentralMangaPage() {
       .finally(() => setChapLoading(false))
   }, [id])
 
+  // ── Phase 3: fetch translated chapters from library ───────────────────────
+  // manga_id for WeebCentral chapters is the series ULID (same as `id` param).
+
+  useEffect(() => {
+    if (!id) return
+    fetch(`/api/library/manga/${id}`)
+      .then(r => r.ok ? r.json() : { chapters: [] })
+      .then(data => {
+        const entries = (data.chapters ?? []) as LibraryEntry[]
+        // Build lookup by chapter_num  (e.g. "378" → library entry)
+        // Also index by wc chapter ULID extracted from mangadex_id ("wc:ULID")
+        const map = new Map<string, LibraryEntry>()
+        for (const entry of entries) {
+          if (entry.chapter_num) map.set(entry.chapter_num, entry)
+          const wcId = entry.mangadex_id?.startsWith('wc:')
+            ? entry.mangadex_id.slice(3)
+            : null
+          if (wcId) map.set(wcId, entry)
+        }
+        setLibMap(map)
+      })
+      .catch(() => {/* library unreachable — just show no badges */})
+  }, [id])
+
   // ── Translate a WeebCentral chapter ──────────────────────────────────────
 
   const handleTranslate = useCallback(async (ch: WCChapter) => {
@@ -87,11 +122,22 @@ export default function WeebCentralMangaPage() {
 
   // ── Sorted chapter list ──────────────────────────────────────────────────
 
-  const sorted = [...chapters].sort((a, b) => {
-    const na = parseFloat(a.number || '0') || 0
-    const nb = parseFloat(b.number || '0') || 0
-    return sortDesc ? nb - na : na - nb
-  })
+  const sorted = [...chapters]
+    .sort((a, b) => {
+      const na = parseFloat(a.number || '0') || 0
+      const nb = parseFloat(b.number || '0') || 0
+      return sortDesc ? nb - na : na - nb
+    })
+    .filter(ch => {
+      const translated = !!(libMap.get(ch.number) ?? libMap.get(ch.id))
+      if (filter === 'translated')   return  translated
+      if (filter === 'untranslated') return !translated
+      return true
+    })
+
+  const translatedCount = chapters.filter(ch =>
+    !!(libMap.get(ch.number) ?? libMap.get(ch.id))
+  ).length
 
   // ── Render: loading ────────────────────────────────────────────────────────
 
@@ -167,6 +213,12 @@ export default function WeebCentralMangaPage() {
                 chapters available
               </span>
             )}
+            {!chapLoading && translatedCount > 0 && (
+              <span className="text-zinc-400">
+                <span className="font-bold" style={{ color: 'var(--accent)' }}>{translatedCount}</span>{' '}
+                in Hebrew
+              </span>
+            )}
             <a
               href={series.url}
               target="_blank"
@@ -184,14 +236,36 @@ export default function WeebCentralMangaPage() {
         <h2 className="text-lg font-bold text-zinc-100">Chapters</h2>
 
         {!chapLoading && chapters.length > 0 && (
-          <button
-            onClick={() => setSortDesc(d => !d)}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
-            style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}
-            title={sortDesc ? 'Showing newest first — click for oldest first' : 'Showing oldest first — click for newest first'}
-          >
-            {sortDesc ? '↓ Newest' : '↑ Oldest'}
-          </button>
+          <div className="flex items-center gap-2 flex-wrap">
+            {/* Filter toggle — same as MangaDex page */}
+            <div
+              className="flex items-center gap-1 p-1 rounded-xl text-xs"
+              style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}
+            >
+              {(['all', 'translated', 'untranslated'] as const).map(f => (
+                <button
+                  key={f}
+                  onClick={() => setFilter(f)}
+                  className={`px-3 py-1.5 rounded-lg font-medium transition-all ${
+                    filter === f ? 'text-white' : 'text-zinc-500 hover:text-zinc-300'
+                  }`}
+                  style={filter === f ? { background: 'var(--accent)' } : undefined}
+                >
+                  {f === 'translated' ? '✓ Hebrew' : f === 'untranslated' ? '○ Untranslated' : 'All'}
+                </button>
+              ))}
+            </div>
+
+            {/* Sort toggle */}
+            <button
+              onClick={() => setSortDesc(d => !d)}
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-medium text-zinc-400 hover:text-zinc-200 transition-colors"
+              style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}
+              title={sortDesc ? 'Showing newest first — click for oldest first' : 'Showing oldest first — click for newest first'}
+            >
+              {sortDesc ? '↓ Newest' : '↑ Oldest'}
+            </button>
+          </div>
         )}
       </div>
 
@@ -219,7 +293,9 @@ export default function WeebCentralMangaPage() {
         <div className="card divide-y divide-zinc-800/40 overflow-hidden">
           {sorted.length === 0 && (
             <div className="px-5 py-10 text-center text-zinc-500 text-sm">
-              No chapters found. The series page structure may have changed.
+              {chapters.length === 0
+                ? 'No chapters found. The series page structure may have changed.'
+                : 'No chapters match this filter.'}
             </div>
           )}
 
@@ -228,23 +304,58 @@ export default function WeebCentralMangaPage() {
             // Fall back to the raw title or ID only when number is missing.
             const label = ch.number ? `Ch. ${ch.number}` : ch.title || ch.id
 
-            const isBusy = translating === ch.id
+            const isBusy    = translating === ch.id
+            // Match by chapter number or by the WC chapter ULID
+            const libEntry  = libMap.get(ch.number) ?? libMap.get(ch.id)
+            const translated = !!libEntry
 
             return (
               <div
                 key={ch.id}
                 className="flex items-center gap-3 px-4 py-3 hover:bg-[var(--accent-subtle)] transition-colors"
               >
+                {/* Dot — green when translated, grey otherwise */}
                 <div
                   className="shrink-0 w-2 h-2 rounded-full"
-                  style={{ background: 'var(--card-border-hover)' }}
+                  style={{ background: translated ? 'var(--accent)' : 'var(--card-border-hover)' }}
                 />
 
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-zinc-400 truncate">{label}</p>
                 </div>
 
-                {/* Open chapter on WeebCentral */}
+                {/* Primary action: Read Hebrew (translated) or Translate (not yet) */}
+                {translated ? (
+                  <Link
+                    href={`/library/${libEntry!.id}`}
+                    className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all"
+                    style={{
+                      background: 'rgba(34,197,94,0.12)',
+                      border:     '1px solid rgba(34,197,94,0.3)',
+                      color:      '#4ade80',
+                    }}
+                  >
+                    ✓ Read Hebrew
+                  </Link>
+                ) : (
+                  <button
+                    onClick={() => handleTranslate(ch)}
+                    disabled={isBusy || translating !== null}
+                    className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                    style={{
+                      background: 'var(--accent-subtle)',
+                      border:     '1px solid var(--card-border-hover)',
+                      color:      '#c4b5fd',
+                    }}
+                    title="Translate this chapter to Hebrew"
+                  >
+                    {isBusy
+                      ? <><Spinner size="sm" /> Starting…</>
+                      : <>Translate →</>}
+                  </button>
+                )}
+
+                {/* Secondary: open on WeebCentral */}
                 <a
                   href={ch.url}
                   target="_blank"
@@ -255,23 +366,6 @@ export default function WeebCentralMangaPage() {
                 >
                   ↗
                 </a>
-
-                {/* Translate to Hebrew */}
-                <button
-                  onClick={() => handleTranslate(ch)}
-                  disabled={isBusy || translating !== null}
-                  className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
-                  style={{
-                    background: 'var(--accent-subtle)',
-                    border:     '1px solid var(--card-border-hover)',
-                    color:      '#c4b5fd',
-                  }}
-                  title="Translate this chapter to Hebrew"
-                >
-                  {isBusy
-                    ? <><Spinner size="sm" /> Starting…</>
-                    : <>Translate →</>}
-                </button>
               </div>
             )
           })}

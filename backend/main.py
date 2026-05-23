@@ -43,6 +43,65 @@ job_manager = JobManager()
 
 
 # ---------------------------------------------------------------------------
+# Startup: scan completed jobs and register any that are not yet in the library
+# ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def _startup_scan_library() -> None:
+    """
+    On every server start, walk data/jobs/ and register any job that:
+      • has a chapter_meta.json  (was a URL-based job with metadata)
+      • has output/result_compressed.pdf  (pipeline ran to completion)
+      • is NOT already in the library DB (checked by mangadex_id)
+
+    This makes library registration resilient to server restarts that killed
+    the background task before it could commit.
+    """
+    registered = skipped = failed = 0
+    r2_mode = library._r2_mode()
+    for job_dir in sorted(JOBS_DIR.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        meta_path = job_dir / "chapter_meta.json"
+        # Accept either result.pdf or result_compressed.pdf as completion markers
+        output_dir    = job_dir / "output"
+        pdf_path      = output_dir / "result_compressed.pdf"
+        pdf_path_full = output_dir / "result.pdf"
+        if not meta_path.exists() or (not pdf_path.exists() and not pdf_path_full.exists()):
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            mangadex_id = meta.get("mangadex_id", "")
+            if not mangadex_id:
+                continue
+            cached = await library.check_cache(mangadex_id)
+            if cached:
+                # If R2 is now active but the stored URL is a local /api/ path,
+                # re-register to upgrade it to a permanent R2 URL.
+                if r2_mode and str(cached.get("pdf_url", "")).startswith("/api/"):
+                    await _register_in_library(job_dir)
+                    registered += 1
+                else:
+                    skipped += 1
+                continue
+            await _register_in_library(job_dir)
+            registered += 1
+        except Exception as exc:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "[startup] Failed to register job %s: %s", job_dir.name, exc
+            )
+            failed += 1
+
+    if registered or failed:
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "[startup] Library scan: %d registered, %d skipped (already in DB), %d failed",
+            registered, skipped, failed,
+        )
+
+
+# ---------------------------------------------------------------------------
 # Request bodies
 # ---------------------------------------------------------------------------
 
@@ -182,9 +241,19 @@ async def download_result(job_id: str, compressed: bool = False):
             full = output_dir / "result.pdf"
             if not full.exists():
                 raise HTTPException(status_code=404, detail="Result not ready yet.")
-            # Generate compressed PDF in a thread (CPU-bound image work)
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(None, _build_compressed_pdf, output_dir, result)
+            # Try to generate a compressed PDF from the page images.
+            # If the pages were already cleaned up after R2 upload, fall back
+            # to serving the full-quality PDF so the download still works.
+            try:
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(None, _build_compressed_pdf, output_dir, result)
+            except Exception:
+                # Page images were cleaned up (e.g. after R2 upload) — serve full PDF
+                return FileResponse(
+                    full,
+                    media_type="application/pdf",
+                    filename="translated_manga_compressed.pdf",
+                )
         return FileResponse(
             result,
             media_type="application/pdf",
@@ -379,10 +448,11 @@ async def _run_pipeline_from_url(
         asyncio.create_task(_cleanup_intermediates(job_dir))
 
         # ── Library: build compressed PDF + register chapter ──────────────
-        # Runs after the "done" event so the user already has their download
-        # link.  Library registration is best-effort — errors are logged but
-        # never surface to the user.
-        asyncio.create_task(_register_in_library(job_dir, emit=emit))
+        # "done" was already emitted inside _run_pipeline_steps, so awaiting
+        # registration here doesn't block the user from getting their link.
+        # We await (rather than create_task) so the write commits before the
+        # coroutine returns — a server restart no longer loses the entry.
+        await _register_in_library(job_dir, emit=emit)
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})
@@ -485,10 +555,14 @@ def _parse_wc_series(html_text: str, *, limit: int = 30) -> list[dict]:
             continue  # skip slugs like "random", "popular", navigation links
 
         img_tag = link.find("img")
-        cover   = img_tag.get("src", "").strip() if img_tag else ""
+        cover = img_tag.get("src", "").strip() if img_tag else ""
 
         # Title: prefer img alt text, then first non-trivial text node
         title = (img_tag.get("alt", "").strip() if img_tag else "") or ""
+         # If it ends with "cover", strip it out
+        if title.endswith("cover"):
+            title = title[:-5].strip()  # Cut off 'title' and clean up any remaining spaces
+
         if not title:
             for el in link.descendants:
                 t = el.get_text(strip=True) if hasattr(el, "get_text") else ""
@@ -759,6 +833,284 @@ async def get_library():
     return {"chapters": chapters, "library_enabled": library.library_enabled()}
 
 
+@app.post("/api/library/rescan", status_code=200)
+async def rescan_library():
+    """
+    Two-phase library recovery scan:
+
+    Phase 1 — local jobs:
+      Walk data/jobs/ and register any completed job that either isn't in the
+      library DB yet, OR is registered with a local /api/ URL while R2 is now
+      configured (so the entry gets upgraded to a permanent R2 URL).
+
+    Phase 2 — R2 discovery (only when R2 is configured):
+      List all chapter folders in Cloudflare R2, fetch metadata from the
+      MangaDex API (or WeebCentral for wc: IDs), and register any chapter
+      that is in R2 but not in the local job directory (e.g. the job was
+      already cleaned up or translated on a different machine).
+
+    Returns: { registered, updated, skipped, failed }
+    """
+    r2_mode = library._r2_mode()
+    registered = updated = skipped = failed = 0
+
+    # ── Phase 1: local jobs ───────────────────────────────────────────────────
+    for job_dir in sorted(JOBS_DIR.iterdir()):
+        if not job_dir.is_dir():
+            continue
+        meta_path     = job_dir / "chapter_meta.json"
+        output_dir    = job_dir / "output"
+        pdf_path      = output_dir / "result_compressed.pdf"
+        pdf_path_full = output_dir / "result.pdf"
+        if not meta_path.exists() or (not pdf_path.exists() and not pdf_path_full.exists()):
+            continue
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            mangadex_id = meta.get("mangadex_id", "")
+            if not mangadex_id:
+                continue
+
+            cached = await library.check_cache(mangadex_id)
+            if cached:
+                # If R2 is now configured but the stored URL is still a local
+                # /api/ path, force-reregister to upgrade to R2 URLs.
+                if r2_mode and str(cached.get("pdf_url", "")).startswith("/api/"):
+                    await _register_in_library(job_dir)
+                    updated += 1
+                else:
+                    skipped += 1
+                continue
+
+            await _register_in_library(job_dir)
+            registered += 1
+        except Exception as exc:
+            import logging as _log
+            _log.getLogger(__name__).warning(
+                "[rescan] Local job %s failed: %s", job_dir.name, exc
+            )
+            failed += 1
+
+    # ── Phase 2: R2 discovery ─────────────────────────────────────────────────
+    if r2_mode:
+        try:
+            r2_results = await _scan_r2_chapters()
+            registered += r2_results["registered"]
+            skipped    += r2_results["skipped"]
+            failed     += r2_results["failed"]
+        except Exception as exc:
+            import logging as _log
+            _log.getLogger(__name__).error("[rescan] R2 scan crashed: %s", exc, exc_info=True)
+            failed += 1
+
+    return {"registered": registered, "updated": updated,
+            "skipped": skipped, "failed": failed}
+
+
+async def _scan_r2_chapters() -> dict:
+    """
+    List all chapter folders in Cloudflare R2 and register any that are not
+    already in the library DB.
+
+    R2 layout:  chapters/{mangadex_id}/compressed.pdf
+                chapters/{mangadex_id}/pages/001.jpg …
+
+    Metadata is fetched from MangaDex API (UUID) or WeebCentral scrape (wc:…).
+    """
+    import logging as _log
+    import httpx
+
+    _logger = _log.getLogger(__name__)
+    registered = skipped = failed = 0
+
+    try:
+        import aioboto3  # noqa: PLC0415
+    except ImportError:
+        _logger.warning("[r2-scan] aioboto3 not installed; skipping R2 discovery")
+        return {"registered": 0, "skipped": 0, "failed": 0}
+
+    def _r2_env(k: str) -> str:
+        import os
+        return os.getenv(k, "").strip()
+
+    r2_public = _r2_env("R2_PUBLIC_URL").rstrip("/")
+    bucket    = _r2_env("R2_BUCKET")
+    endpoint  = f"https://{_r2_env('R2_ACCOUNT_ID')}.r2.cloudflarestorage.com"
+
+    session = aioboto3.Session()
+    async with session.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=_r2_env("R2_ACCESS_KEY_ID"),
+        aws_secret_access_key=_r2_env("R2_SECRET_KEY"),
+        region_name="auto",
+    ) as s3:
+        # List all "folders" directly under chapters/ (no paginator — few chapters)
+        resp = await s3.list_objects_v2(
+            Bucket=bucket, Prefix="chapters/", Delimiter="/"
+        )
+        common_prefixes = resp.get("CommonPrefixes", [])
+        _logger.info("[r2-scan] Found %d chapter folder(s) in R2", len(common_prefixes))
+
+        for cp in common_prefixes:
+            folder = cp["Prefix"]           # e.g. "chapters/afaebc64-.../
+            parts  = folder.rstrip("/").split("/")
+            if len(parts) < 2:
+                continue
+            mangadex_id = parts[1]
+
+            cached = await library.check_cache(mangadex_id)
+            if cached:
+                skipped += 1
+                continue
+
+            pdf_key   = f"{folder}compressed.pdf"
+            pages_pfx = f"{folder}pages"
+
+            # Verify PDF exists and get size
+            try:
+                head = await s3.head_object(Bucket=bucket, Key=pdf_key)
+                pdf_size_kb = head["ContentLength"] // 1024
+            except Exception:
+                _logger.debug("[r2-scan] No PDF at %s — skip", pdf_key)
+                continue
+
+            # Count page images
+            pages_resp = await s3.list_objects_v2(
+                Bucket=bucket, Prefix=f"{pages_pfx}/"
+            )
+            page_count = len(pages_resp.get("Contents", []))
+
+            # Fetch chapter metadata from MangaDex / WeebCentral
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as hclient:
+                    meta = await _fetch_chapter_meta_for_id(hclient, mangadex_id)
+            except Exception as exc:
+                _logger.warning("[r2-scan] Metadata fetch failed for %s: %s", mangadex_id, exc)
+                meta = {}   # register with minimal data rather than skip
+
+            lid = await library.register_chapter(
+                mangadex_id   = mangadex_id,
+                manga_title   = meta.get("manga_title", "Unknown"),
+                manga_id      = meta.get("manga_id", ""),
+                chapter_num   = meta.get("chapter_num", ""),
+                chapter_title = meta.get("chapter_title", ""),
+                cover_url     = meta.get("cover_url", ""),
+                page_count    = page_count,
+                pdf_url       = f"{r2_public}/{pdf_key}",
+                pages_prefix  = f"{r2_public}/{pages_pfx}",
+                pdf_size_kb   = pdf_size_kb,
+            )
+            if lid:
+                _logger.info("[r2-scan] Registered %s → %s", mangadex_id, lid)
+                registered += 1
+            else:
+                failed += 1
+
+    return {"registered": registered, "skipped": skipped, "failed": failed}
+
+
+async def _fetch_chapter_meta_for_id(client, mangadex_id: str) -> dict:
+    """
+    Return { manga_title, manga_id, chapter_num, chapter_title, cover_url }
+    for a chapter ID that may be a MangaDex UUID or a WeebCentral wc:ULID.
+    """
+    import re
+
+    _MD_API = "https://api.mangadex.org"
+    _WC_BASE = "https://weebcentral.com"
+    _WC_ID_RE = re.compile(r"[0-9A-HJKMNP-TV-Z]{26}", re.IGNORECASE)
+
+    # ── WeebCentral ────────────────────────────────────────────────────────────
+    if mangadex_id.startswith("wc:"):
+        wc_id = mangadex_id[3:]
+        wc_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Referer": _WC_BASE + "/",
+        }
+        r = await client.get(f"{_WC_BASE}/chapters/{wc_id}", headers=wc_headers)
+        if not r.is_success:
+            return {}
+        from bs4 import BeautifulSoup  # noqa: PLC0415
+        soup = BeautifulSoup(r.text, "html.parser")
+        series_id = series_title = chapter_num = cover_url = ""
+        for link in soup.find_all("a", href=True):
+            href = link.get("href", "")
+            if "/series/" in href:
+                m = _WC_ID_RE.search(href)
+                if m:
+                    series_id    = m.group(0).upper()
+                    series_title = link.get_text(strip=True)
+                    break
+        title_tag = soup.find("title")
+        if title_tag:
+            nm = re.search(r"chapter\s*([\d.]+)", title_tag.get_text(), re.I)
+            chapter_num = nm.group(1) if nm else ""
+        og = soup.find("meta", property="og:image")
+        if og:
+            cover_url = og.get("content", "").strip()
+        return {
+            "manga_title":   series_title or "Unknown",
+            "manga_id":      series_id,
+            "chapter_num":   chapter_num,
+            "chapter_title": "",
+            "cover_url":     cover_url,
+        }
+
+    # ── MangaDex ───────────────────────────────────────────────────────────────
+    manga_id = manga_title = chapter_title = cover_url = ""
+    chapter_num = "?"
+    try:
+        r = await client.get(
+            f"{_MD_API}/chapter/{mangadex_id}",
+            params={"includes[]": ["manga"]},
+            headers={"User-Agent": "HebrewMangaTranslator/0.1"},
+        )
+        r.raise_for_status()
+        data  = r.json().get("data", {})
+        attrs = data.get("attributes", {})
+        chapter_num   = attrs.get("chapter") or "?"
+        chapter_title = attrs.get("title") or ""
+        for rel in data.get("relationships", []):
+            if rel.get("type") == "manga":
+                manga_id = rel.get("id", "")
+                titles   = (rel.get("attributes") or {}).get("title", {})
+                manga_title = (
+                    titles.get("en") or titles.get("ja-ro")
+                    or next(iter(titles.values()), "")
+                )
+                break
+    except Exception:
+        pass
+
+    if manga_id:
+        try:
+            cr = await client.get(
+                f"{_MD_API}/cover",
+                params={"manga[]": manga_id, "limit": 1, "order[volume]": "asc"},
+                headers={"User-Agent": "HebrewMangaTranslator/0.1"},
+            )
+            cr.raise_for_status()
+            covers = cr.json().get("data", [])
+            if covers:
+                fname = covers[0]["attributes"]["fileName"]
+                cover_url = (
+                    f"https://uploads.mangadex.org/covers/{manga_id}/{fname}.512.jpg"
+                )
+        except Exception:
+            pass
+
+    return {
+        "manga_title":   manga_title or "Unknown",
+        "manga_id":      manga_id,
+        "chapter_num":   chapter_num,
+        "chapter_title": chapter_title,
+        "cover_url":     cover_url,
+    }
+
+
 @app.get("/api/library/manga/{mangadex_manga_id}")
 async def get_library_by_manga(mangadex_manga_id: str):
     """
@@ -847,6 +1199,11 @@ async def _run_pipeline_from_step(
             "total_pages":  len(pages),
             "download_url": f"/api/jobs/{job_id}/download",
         })
+
+        # Clean up intermediate artifacts and register in library —
+        # same as the full URL pipeline so resumed jobs are also indexed.
+        asyncio.create_task(_cleanup_intermediates(job_dir))
+        await _register_in_library(job_dir, emit=emit)
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})

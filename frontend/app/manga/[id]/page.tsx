@@ -426,20 +426,8 @@ export default function MangaPage() {
                     ✓ Read Hebrew
                   </Link>
                 ) : (
-                  /* ── Not translated: read source OR start translation ── */
+                  /* ── Not translated: translate first, then open source ── */
                   <div className="shrink-0 flex items-center gap-1.5">
-                    {/* Open MangaDex reader in new tab */}
-                    <a
-                      href={`https://mangadex.org/chapter/${ch.id}`}
-                      target="_blank"
-                      rel="noopener noreferrer"
-                      className="flex items-center px-2.5 py-1.5 rounded-lg text-xs transition-all text-zinc-500 hover:text-zinc-200"
-                      style={{ border: '1px solid var(--card-border)' }}
-                      title="Read on MangaDex"
-                    >
-                      ↗
-                    </a>
-
                     {/* Translate to Hebrew */}
                     <button
                       onClick={() => handleTranslate(ch)}
@@ -456,6 +444,18 @@ export default function MangaPage() {
                         ? <><Spinner size="sm" /> Starting…</>
                         : <>Translate →</>}
                     </button>
+
+                    {/* Open MangaDex reader in new tab */}
+                    <a
+                      href={`https://mangadex.org/chapter/${ch.id}`}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="flex items-center px-2.5 py-1.5 rounded-lg text-xs transition-all text-zinc-500 hover:text-zinc-200"
+                      style={{ border: '1px solid var(--card-border)' }}
+                      title="Read on MangaDex"
+                    >
+                      ↗
+                    </a>
                   </div>
                 )}
               </div>

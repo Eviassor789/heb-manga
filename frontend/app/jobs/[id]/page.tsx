@@ -114,10 +114,12 @@ export default function JobPage() {
         }
         const { stage, status, page, total, message, download_url, total_pages } = data
 
-        // Library registration complete — show reader button
+        // Library registration complete → navigate straight to the reader
         if (stage === 'library_ready' && data.library_id) {
           setLibraryId(data.library_id)
-          addActivity('done', '📚 Chapter added to shared library')
+          addActivity('done', '📚 Chapter added to library — opening reader…')
+          es.close()
+          router.push(`/library/${data.library_id}`)
           return
         }
         // Accumulate Gemini costs — both OCR and translate stages emit a `cost` payload
@@ -381,37 +383,26 @@ export default function JobPage() {
         </div>
       )}
 
-      {/* Download panel */}
+      {/* Done panel — navigating to reader (or waiting for library_ready) */}
+      {done && !libraryId && (
+        <div className="w-full max-w-2xl mb-4 animate-fade-in">
+          <div className="card p-5">
+            <div className="flex items-center gap-3">
+              <span className="text-3xl">🎉</span>
+              <div className="flex-1">
+                <p className="font-semibold text-zinc-100">Translation complete!</p>
+                <p className="text-sm text-zinc-400 mt-0.5">Adding to library — opening reader in a moment…</p>
+              </div>
+              <Spinner />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Cost breakdown — shown while waiting, hidden after redirect */}
       {done && downloadUrl && (
         <div className="w-full max-w-2xl mb-4 animate-fade-in">
           <div className="card p-5">
-            <div className="flex items-center gap-3 mb-4">
-              <span className="text-3xl">🎉</span>
-              <div>
-                <p className="font-semibold text-zinc-100">Translation complete!</p>
-                <p className="text-sm text-zinc-400 mt-0.5">Assembled into PDF · ready to download</p>
-              </div>
-            </div>
-
-            <div className="flex gap-3 mb-4">
-              <a href={`${downloadUrl}?compressed=true`} download
-                className="btn-primary flex-1 flex items-center justify-center gap-2 no-underline">
-                ⬇ Download PDF
-              </a>
-              {libraryId && (
-                <a href={`/library/${libraryId}`}
-                  className="flex-1 flex items-center justify-center gap-2 no-underline
-                             bg-green-700 hover:bg-green-600 text-white font-semibold
-                             px-4 py-3 rounded-xl transition-colors">
-                  📖 Read in Hebrew
-                </a>
-              )}
-            </div>
-            {!libraryId && done && (
-              <p className="text-xs text-zinc-600 text-center mb-4">
-                Uploading to shared library…
-              </p>
-            )}
 
             {/* Unified cost breakdown */}
             {(geminiCost || Object.keys(modalSeconds).length > 0) && (() => {

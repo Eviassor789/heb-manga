@@ -109,16 +109,32 @@ async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     total = len(pages)
     modal_seconds = 0.0
 
+    # Pre-warm LaMa in the executor so any load errors surface once, cleanly,
+    # before we start processing pages. If LaMa fails, _lama_ok=False and all
+    # pages will use the OpenCV fallback without re-attempting the download.
+    if not _USE_MODAL:
+        await loop.run_in_executor(_executor, _get_lama)
+
     for i, page_path in enumerate(pages, start=1):
         mask_path = detection_dir / f"{page_path.stem}_mask.png"
         out_path  = cleaned_dir   / page_path.name
 
-        if _USE_MODAL:
-            t0 = time.perf_counter()
-            await _inpaint_page_modal(page_path, mask_path, out_path)
-            modal_seconds += time.perf_counter() - t0
-        else:
-            await loop.run_in_executor(_executor, _inpaint_page, page_path, mask_path, out_path)
+        try:
+            if _USE_MODAL:
+                t0 = time.perf_counter()
+                await _inpaint_page_modal(page_path, mask_path, out_path)
+                modal_seconds += time.perf_counter() - t0
+            else:
+                await loop.run_in_executor(_executor, _inpaint_page, page_path, mask_path, out_path)
+        except Exception as exc:
+            # If inpainting fails for any reason, fall back to copying the original.
+            # The typesetter will still add Hebrew text on top; the page stays readable.
+            import logging as _log
+            _log.getLogger(__name__).error(
+                "[inpainter] Page %s failed (%s) — copying original as fallback", page_path.name, exc
+            )
+            await loop.run_in_executor(None, shutil.copy2, page_path, out_path)
+
         await emit({"stage": "inpaint", "status": "running", "page": i, "total": total})
 
     await emit({

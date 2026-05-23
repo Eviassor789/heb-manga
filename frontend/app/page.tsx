@@ -4,7 +4,6 @@ import { useEffect, useMemo, useState } from 'react'
 import Link from 'next/link'
 import MangaCard from '@/components/MangaCard'
 import SkeletonCard from '@/components/SkeletonCard'
-import Spinner from '@/components/Spinner'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -72,6 +71,7 @@ export default function LibraryPage() {
   const [search,         setSearch]         = useState('')
 
   useEffect(() => {
+    setLoading(true)
     fetch('/api/library')
       .then(r => r.json())
       .then(data => {
@@ -174,6 +174,29 @@ export default function LibraryPage() {
       {/* ── Manga grid ── */}
       {!loading && series.length > 0 && (
         <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-4">
+
+          {/* "+" card — always first so it's always in view */}
+          <Link href="/discover" className="group block">
+            <div
+              className="rounded-xl overflow-hidden border-2 border-dashed transition-all duration-200"
+              style={{ borderColor: 'var(--card-border)' }}
+              onMouseEnter={e => (e.currentTarget.style.borderColor = 'var(--accent)')}
+              onMouseLeave={e => (e.currentTarget.style.borderColor = 'var(--card-border)')}
+            >
+              {/* Cover area — same aspect ratio as real cards */}
+              <div className="aspect-[3/4] flex flex-col items-center justify-center text-zinc-600 group-hover:text-[var(--accent)] group-hover:bg-[var(--accent-subtle)] transition-all duration-200">
+                <span className="text-5xl leading-none group-hover:scale-110 transition-transform duration-200 mb-1">＋</span>
+              </div>
+              {/* Text area — same height as the manga-card info block */}
+              <div className="p-3 flex flex-col" style={{ minHeight: '5.25rem', background: 'var(--card-bg)' }}>
+                <p className="text-sm font-semibold text-zinc-500 group-hover:text-[var(--accent)] transition-colors leading-snug" style={{ minHeight: '2.625rem' }}>
+                  Add manga
+                </p>
+                <p className="text-xs text-zinc-600 mt-1">Browse Discover →</p>
+              </div>
+            </div>
+          </Link>
+
           {series.map(s => (
             <MangaCard
               key={s.manga_id || s.manga_title}
@@ -183,15 +206,6 @@ export default function LibraryPage() {
               subtitle={`${s.chapter_count} chapter${s.chapter_count !== 1 ? 's' : ''} in Hebrew`}
             />
           ))}
-
-          {/* "+" card to discover more */}
-          <Link
-            href="/discover"
-            className="group flex flex-col items-center justify-center aspect-[3/4] rounded-xl border-2 border-dashed border-[var(--card-border)] hover:border-[var(--accent)] hover:bg-[var(--accent-subtle)] transition-all duration-200 text-zinc-600 hover:text-[var(--accent)]"
-          >
-            <span className="text-3xl mb-2 group-hover:scale-110 transition-transform">＋</span>
-            <span className="text-xs font-medium">Add manga</span>
-          </Link>
         </div>
       )}
 

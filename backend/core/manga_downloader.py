@@ -311,14 +311,16 @@ async def _wc_fetch_images(client: httpx.AsyncClient, chapter_id: str) -> list[s
     """
     Return the list of page image URLs for a WeebCentral chapter.
 
-    WeebCentral uses HTMX: the main reader page has NO <img> tags.  On load,
-    the browser fires a GET to /chapters/{id}/images?… which returns a plain
-    HTML fragment containing all <img src="https://cdn…"> tags.  We replicate
-    that HTMX request here.
+    Strategy (tried in order):
+      1. HTMX images fragment — GET /chapters/{id}/images?reading_style=long_strip
+         with HX-Request: true.  This returns a plain HTML fragment with all
+         <img src="https://cdn…"> tags and is the fastest path.
+      2. Fallback: scrape the full chapter reader page (no HX-Request header).
+         Some CDNs / Cloudflare edge nodes return the full page instead of the
+         fragment.  We still find the same <img> tags.
 
-    URL:     GET /chapters/{id}/images?is_prev=False&current_page=1&reading_style=long_strip
-    Headers: HX-Request: true  (required — without it the server returns the full page)
-             Referer: https://weebcentral.com/chapters/{id}
+    Both strategies parse every <img> tag (src + data-src) and filter via
+    _is_manga_page_url so site chrome (logos, icons, etc.) is discarded.
     """
     from bs4 import BeautifulSoup  # noqa: PLC0415
 
@@ -328,39 +330,85 @@ async def _wc_fetch_images(client: httpx.AsyncClient, chapter_id: str) -> list[s
         "HX-Request":  "true",
         "Referer":     f"{_WC_BASE}/chapters/{chapter_id}",
     }
-    images_url = (
-        f"{_WC_BASE}/chapters/{chapter_id}/images"
-        f"?is_prev=False&current_page=1&reading_style=long_strip"
-    )
 
-    try:
-        r = await client.get(images_url, headers=htmx_headers)
-        if r.is_success:
-            soup = BeautifulSoup(r.text, "html.parser")
-            urls: list[str] = []
-            for img in soup.find_all("img"):
-                src = (img.get("src") or img.get("data-src") or "").strip()
-                if src and _is_manga_page_url(src):
-                    urls.append(src)
-            if urls:
-                log.info(
-                    "[downloader-wc] HTMX images endpoint returned %d pages for %s",
-                    len(urls), chapter_id,
+    # ── Strategy 1: HTMX images fragment ─────────────────────────────────────
+    for reading_style in ("long_strip", "single_page"):
+        images_url = (
+            f"{_WC_BASE}/chapters/{chapter_id}/images"
+            f"?is_prev=False&current_page=1&reading_style={reading_style}"
+        )
+        try:
+            r = await client.get(images_url, headers=htmx_headers)
+            if r.is_success:
+                urls = _extract_page_images(r.text, chapter_id, source=f"HTMX/{reading_style}")
+                if urls:
+                    return urls
+                log.warning(
+                    "[downloader-wc] HTMX %s: success but 0 valid img tags (chapter %s). "
+                    "Response preview: %.300s", reading_style, chapter_id, r.text,
                 )
+            else:
+                log.warning(
+                    "[downloader-wc] HTMX %s endpoint returned HTTP %s for chapter %s",
+                    reading_style, r.status_code, chapter_id,
+                )
+        except Exception as exc:
+            log.warning(
+                "[downloader-wc] HTMX %s request failed for %s: %s",
+                reading_style, chapter_id, exc,
+            )
+
+    # ── Strategy 2: full chapter reader page (fallback) ───────────────────────
+    log.info(
+        "[downloader-wc] Falling back to full reader page scrape for chapter %s", chapter_id,
+    )
+    try:
+        page_headers = {**_WC_HEADERS, "Accept": "text/html,application/xhtml+xml,*/*"}
+        r = await client.get(
+            f"{_WC_BASE}/chapters/{chapter_id}",
+            headers=page_headers,
+        )
+        if r.is_success:
+            urls = _extract_page_images(r.text, chapter_id, source="full-page")
+            if urls:
                 return urls
             log.warning(
-                "[downloader-wc] HTMX endpoint returned success but no valid img tags "
-                "(chapter %s).  Response preview: %s", chapter_id, r.text[:300],
+                "[downloader-wc] Full-page fallback: 0 valid img tags for chapter %s. "
+                "Response preview: %.300s", chapter_id, r.text,
             )
         else:
             log.warning(
-                "[downloader-wc] HTMX images endpoint returned HTTP %s for chapter %s",
+                "[downloader-wc] Full-page fallback returned HTTP %s for chapter %s",
                 r.status_code, chapter_id,
             )
     except Exception as exc:
-        log.warning("[downloader-wc] HTMX images request failed for %s: %s", chapter_id, exc)
+        log.warning("[downloader-wc] Full-page fallback failed for %s: %s", chapter_id, exc)
 
     return []
+
+
+def _extract_page_images(html: str, chapter_id: str, *, source: str) -> list[str]:
+    """Parse an HTML fragment/page and return all manga-page image URLs."""
+    from bs4 import BeautifulSoup  # noqa: PLC0415
+
+    soup = BeautifulSoup(html, "html.parser")
+    urls: list[str] = []
+    for img in soup.find_all("img"):
+        src = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-lazy-src")
+            or img.get("data-original")
+            or ""
+        ).strip()
+        if src and _is_manga_page_url(src):
+            urls.append(src)
+    if urls:
+        log.info(
+            "[downloader-wc] %s returned %d pages for chapter %s",
+            source, len(urls), chapter_id,
+        )
+    return urls
 
 
 def _is_manga_page_url(url: str) -> bool:
@@ -369,13 +417,29 @@ def _is_manga_page_url(url: str) -> bool:
     if not url.startswith(("http://", "https://")):
         return False
     url_lower = url.lower()
-    for skip in ("logo", "icon", "avatar", "banner", "thumb-sm", "favicon", "sprite", "brand"):
+
+    # Hard skip — site chrome that should never appear as manga pages
+    # ("broken_image" is WeebCentral's onerror fallback placeholder)
+    for skip in ("logo", "icon", "avatar", "banner", "thumb-sm", "favicon",
+                 "sprite", "brand", "broken_image"):
         if skip in url_lower:
             return False
-    for good in ("compsci88", "/chapters/", "/manga/", "/page/", "/pages/"):
+
+    # Known-good CDN domains and path fragments — accept immediately
+    for good in (
+        "compsci88",
+        "scans.lastation.us",   # WeebCentral primary CDN
+        "weebcentral.com",
+        "/chapters/",
+        "/manga/",
+        "/page/",
+        "/pages/",
+    ):
         if good in url_lower:
             return True
-    # Accept absolute URL with a common image extension
+
+    # Accept any absolute URL whose path ends with a common image extension
+    # (before an optional query-string).  This catches arbitrary CDN domains.
     return bool(re.search(r'\.(jpe?g|png|webp)(\?|$)', url_lower))
 
 

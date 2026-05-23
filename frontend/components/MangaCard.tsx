@@ -7,7 +7,7 @@ interface MangaCardProps {
   coverUrl?:   string | null
   subtitle?:   string           // e.g. "5 chapters" or "Chapter 12"
   badge?:      string           // e.g. "✓ In Library"
-  badgeColor?: 'green' | 'violet'
+  badgeColor?: 'green' | 'violet' | 'orange'
   external?:   boolean          // open in a new browser tab (for external URLs)
 }
 
@@ -18,7 +18,10 @@ interface MangaCardProps {
 export default function MangaCard({
   href, title, coverUrl, subtitle, badge, badgeColor = 'green', external = false,
 }: MangaCardProps) {
-  const badgeCls = badgeColor === 'green' ? 'badge-green' : 'badge-violet'
+  const badgeCls =
+    badgeColor === 'green'  ? 'badge-green'  :
+    badgeColor === 'orange' ? 'badge-orange' :
+                              'badge-violet'
 
   const inner = (
     <div className="manga-card">
@@ -30,14 +33,18 @@ export default function MangaCard({
         )}
       </div>
 
-      {/* Info */}
-      <div className="p-3">
-        <p className="text-sm font-semibold text-zinc-100 line-clamp-2 leading-snug group-hover:text-white transition-colors">
+      {/* Info — fixed height so all cards are the same regardless of title length */}
+      <div className="p-3 flex flex-col" style={{ minHeight: '5.25rem' }}>
+        {/* Title always reserves 2-line height */}
+        <p
+          className="text-sm font-semibold text-zinc-100 line-clamp-2 leading-snug group-hover:text-white transition-colors"
+          style={{ minHeight: '2.625rem' }}   /* 2 × (0.875rem × 1.375 lh) ≈ 2.406rem; round up */
+        >
           {title}
         </p>
-        {subtitle && (
-          <p className="text-xs text-zinc-500 mt-1">{subtitle}</p>
-        )}
+        <p className="text-xs text-zinc-500 mt-1 truncate">
+          {subtitle ?? ' ' /* non-breaking space keeps the row's height */}
+        </p>
       </div>
     </div>
   )

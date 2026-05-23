@@ -60,7 +60,8 @@ _MIN_FONT_SIZE = 8     # never shrink below this
 _LINE_SPACING  = 4     # extra vertical pixels between consecutive lines
 _PADDING       = 8     # pixels between text block and bbox edges
 
-_TEXT_COLOR = (0, 0, 0)   # solid black — speech bubbles have white/light bg
+_TEXT_COLOR   = (0, 0, 0)          # solid black fill
+_STROKE_COLOR = (255, 255, 255)    # white outline — keeps text legible on any bg
 
 # Heebo Bold: clean, legible at small sizes, OFL license
 _FONT_FILENAME = "Heebo-Bold.ttf"
@@ -316,6 +317,9 @@ def _render_region(
     y_cursor  = y1 + _PADDING + max(0, (avail_h - total_h) // 2)
     x_centre  = (x1 + x2) // 2
 
+    # Scale stroke width with font size: thin at small sizes, thicker at large.
+    stroke_w = max(1, font.size // 11)   # e.g. 1px @ 8–10px, 2px @ 11–21px, 3px @ 22–32px
+
     for line in lines:
         draw.text(
             (x_centre, y_cursor),
@@ -326,6 +330,8 @@ def _render_region(
             #   m = horizontal middle (centres the line around x_centre)
             #   a = ascender top      (y_cursor is the top of the text, not baseline)
             anchor="ma",
+            stroke_width=stroke_w,
+            stroke_fill=_STROKE_COLOR,
         )
         y_cursor += line_h
 

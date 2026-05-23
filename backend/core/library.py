@@ -320,10 +320,10 @@ async def _upload_bytes(key: str, data: bytes, content_type: str) -> str:
 async def check_cache(mangadex_id: str) -> Optional[dict]:
     """
     Return the completed library entry for this chapter ID, or None.
-    Works in all three modes (local / hybrid / full-cloud).
+    Checks Supabase first (if configured), then SQLite as fallback/supplement.
     """
-    try:
-        if _supabase_mode():
+    if _supabase_mode():
+        try:
             sb = _get_sb()
             result = await asyncio.to_thread(
                 lambda: (
@@ -336,12 +336,12 @@ async def check_cache(mangadex_id: str) -> Optional[dict]:
                 )
             )
             rows = result.data or []
-            return rows[0] if rows else None
-        else:
-            return await asyncio.to_thread(_local_check_cache, mangadex_id)
-    except Exception as exc:
-        log.warning("[library] check_cache failed: %s", exc)
-        return None
+            if rows:
+                return rows[0]
+        except Exception as exc:
+            log.warning("[library] check_cache Supabase failed: %s", exc)
+    # Always check SQLite too (chapters may have been registered there as fallback)
+    return await asyncio.to_thread(_local_check_cache, mangadex_id)
 
 
 async def register_chapter(
@@ -360,6 +360,14 @@ async def register_chapter(
     """
     Upsert a completed chapter into the library.
     Returns the row UUID string, or None on failure.
+
+    Write strategy (in priority order):
+      1. Supabase — if configured AND the write succeeds.
+      2. SQLite   — always attempted as fallback (covers wrong Supabase key,
+                    network outage, RLS policy blocks, etc.)
+
+    This ensures the chapter is always indexed somewhere even if the cloud DB
+    is misconfigured, so the library page always works.
     """
     payload = dict(
         mangadex_id=mangadex_id, manga_title=manga_title, manga_id=manga_id,
@@ -367,8 +375,10 @@ async def register_chapter(
         page_count=page_count, pdf_url=pdf_url, pages_prefix=pages_prefix,
         pdf_size_kb=pdf_size_kb,
     )
-    try:
-        if _supabase_mode():
+
+    # ── Try Supabase first ─────────────────────────────────────────────────────
+    if _supabase_mode():
+        try:
             sb = _get_sb()
             result = await asyncio.to_thread(
                 lambda: (
@@ -382,21 +392,39 @@ async def register_chapter(
                 lid = rows[0]["id"]
                 log.info("[library] Supabase: registered %s → %s", mangadex_id, lid)
                 return lid
-            return None
-        else:
-            lid = await asyncio.to_thread(_local_register_chapter, payload)
-            mode = "R2+SQLite" if _r2_mode() else "Local"
-            log.info("[library] %s: registered %s → %s", mode, mangadex_id, lid)
-            return lid
+            # Empty data without exception = upsert silently rejected (unlikely)
+            log.warning("[library] Supabase upsert returned no rows for %s — falling back to SQLite", mangadex_id)
+        except Exception as exc:
+            # 42501 = RLS violation (wrong key type — need service_role, not anon/publishable)
+            err_str = str(exc)
+            if "42501" in err_str or "row-level security" in err_str.lower():
+                log.warning(
+                    "[library] Supabase write blocked by RLS (your SUPABASE_KEY is the "
+                    "publishable/anon key — replace it with the service_role key from "
+                    "Supabase Dashboard → Settings → API). Falling back to SQLite."
+                )
+            else:
+                log.warning("[library] Supabase write failed (%s) — falling back to SQLite", exc)
+
+    # ── Fall back to (or use primary) SQLite ──────────────────────────────────
+    try:
+        lid = await asyncio.to_thread(_local_register_chapter, payload)
+        mode = "R2+SQLite" if _r2_mode() else "Local-SQLite"
+        log.info("[library] %s: registered %s → %s", mode, mangadex_id, lid)
+        return lid
     except Exception as exc:
-        log.error("[library] register_chapter failed: %s", exc)
+        log.error("[library] SQLite register_chapter also failed: %s", exc)
         return None
 
 
 async def list_chapters(limit: int = 200) -> list[dict]:
-    """Return all completed chapters, newest first."""
-    try:
-        if _supabase_mode():
+    """
+    Return all completed chapters, newest first.
+    Merges Supabase + SQLite results so chapters registered in either DB are shown.
+    """
+    sb_rows: list[dict] = []
+    if _supabase_mode():
+        try:
             sb = _get_sb()
             result = await asyncio.to_thread(
                 lambda: (
@@ -408,22 +436,36 @@ async def list_chapters(limit: int = 200) -> list[dict]:
                     .execute()
                 )
             )
-            return result.data or []
-        else:
-            return await asyncio.to_thread(_local_list_chapters, limit)
+            sb_rows = result.data or []
+        except Exception as exc:
+            log.warning("[library] list_chapters Supabase failed: %s", exc)
+
+    # Always include SQLite rows (may have chapters missing from Supabase)
+    try:
+        local_rows = await asyncio.to_thread(_local_list_chapters, limit)
     except Exception as exc:
-        log.error("[library] list_chapters failed: %s", exc)
-        return []
+        log.warning("[library] list_chapters SQLite failed: %s", exc)
+        local_rows = []
+
+    # Merge: Supabase wins on conflict (has the authoritative id), deduplicate by mangadex_id
+    merged: dict[str, dict] = {}
+    for row in local_rows:
+        merged[row["mangadex_id"]] = row
+    for row in sb_rows:                    # Supabase rows overwrite SQLite rows
+        merged[row["mangadex_id"]] = row
+
+    all_rows = sorted(merged.values(), key=lambda r: r.get("translated_at", ""), reverse=True)
+    return all_rows[:limit]
 
 
 async def list_chapters_by_manga(manga_id: str) -> list[dict]:
     """
-    Return translated chapters for a specific manga_id (MangaDex manga UUID or WC series id),
-    selecting only the columns needed by the manga detail page.  Newest-translated first.
-    Works in both local (SQLite) and cloud (Supabase) modes.
+    Return translated chapters for a specific manga_id (MangaDex manga UUID or WC series id).
+    Merges Supabase + SQLite results. Newest-translated first.
     """
-    try:
-        if _supabase_mode():
+    sb_rows: list[dict] = []
+    if _supabase_mode():
+        try:
             sb = _get_sb()
             result = await asyncio.to_thread(
                 lambda: (
@@ -434,18 +476,28 @@ async def list_chapters_by_manga(manga_id: str) -> list[dict]:
                     .execute()
                 )
             )
-            return result.data or []
-        else:
-            return await asyncio.to_thread(_local_list_by_manga, manga_id)
+            sb_rows = result.data or []
+        except Exception as exc:
+            log.warning("[library] list_chapters_by_manga Supabase failed: %s", exc)
+
+    try:
+        local_rows = await asyncio.to_thread(_local_list_by_manga, manga_id)
     except Exception as exc:
-        log.warning("[library] list_chapters_by_manga(%s) failed: %s", manga_id, exc)
-        return []
+        log.warning("[library] list_chapters_by_manga SQLite failed: %s", manga_id, exc)
+        local_rows = []
+
+    merged: dict[str, dict] = {}
+    for row in local_rows:
+        merged[row["mangadex_id"]] = row
+    for row in sb_rows:
+        merged[row["mangadex_id"]] = row
+    return list(merged.values())
 
 
 async def get_chapter(chapter_id: str) -> Optional[dict]:
-    """Return a single chapter by its UUID, or None."""
-    try:
-        if _supabase_mode():
+    """Return a single chapter by its UUID, or None. Checks both Supabase and SQLite."""
+    if _supabase_mode():
+        try:
             sb = _get_sb()
             result = await asyncio.to_thread(
                 lambda: (
@@ -456,11 +508,15 @@ async def get_chapter(chapter_id: str) -> Optional[dict]:
                     .execute()
                 )
             )
-            return result.data
-        else:
-            return await asyncio.to_thread(_local_get_chapter, chapter_id)
+            if result.data:
+                return result.data
+        except Exception as exc:
+            log.warning("[library] get_chapter Supabase failed: %s", exc)
+    # Fallback / always check SQLite
+    try:
+        return await asyncio.to_thread(_local_get_chapter, chapter_id)
     except Exception as exc:
-        log.warning("[library] get_chapter %s failed: %s", chapter_id, exc)
+        log.warning("[library] get_chapter SQLite failed: %s", exc)
         return None
 
 
@@ -529,4 +585,33 @@ async def upload_chapter_files(
     log.info("[library] Uploaded %d page images for %s", page_count, mangadex_id)
 
     pages_prefix = f"{_env('R2_PUBLIC_URL').rstrip('/')}/{pages_key_prefix}"
+
+    # ── Remove local output files — everything is now in R2 ──────────────────
+    # Keep output/result.pdf so /api/jobs/{id}/download still works immediately
+    # after the pipeline.  Delete the heavyweight duplicates that are now in R2.
+    await asyncio.get_running_loop().run_in_executor(None, _cleanup_local_output, output_dir)
+
     return pdf_url, pages_prefix, page_count, pdf_size_kb
+
+
+def _cleanup_local_output(output_dir: Path) -> None:
+    """
+    Delete local files that have been safely uploaded to R2.
+    Removes: pages/ directory, result_compressed.pdf, numbered translated PNGs.
+    Keeps: result.pdf  (served by /api/jobs/{id}/download during the session).
+    """
+    import shutil as _shutil
+    try:
+        pages_dir = output_dir / "pages"
+        if pages_dir.exists():
+            _shutil.rmtree(pages_dir, ignore_errors=True)
+        compressed = output_dir / "result_compressed.pdf"
+        if compressed.exists():
+            compressed.unlink(missing_ok=True)
+        # Remove the large per-page PNGs that live directly in output/
+        for png in output_dir.glob("*.png"):
+            if png.stem.isdigit():
+                png.unlink(missing_ok=True)
+        log.debug("[library] Cleaned local output at %s", output_dir)
+    except Exception as exc:
+        log.warning("[library] _cleanup_local_output failed: %s", exc)
