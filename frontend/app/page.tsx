@@ -179,20 +179,14 @@ export default function LibraryPage() {
           <Link href="/discover" className="group block">
             <div
               className="rounded-xl overflow-hidden border-2 border-dashed transition-all duration-200"
-              style={{ borderColor: 'var(--card-border)' }}
+              style={{ borderColor: 'var(--card-border)', height: '100%' }}
               onMouseEnter={e => (e.currentTarget.style.borderColor = 'var(--accent)')}
               onMouseLeave={e => (e.currentTarget.style.borderColor = 'var(--card-border)')}
             >
               {/* Cover area — same aspect ratio as real cards */}
-              <div className="aspect-[3/4] flex flex-col items-center justify-center text-zinc-600 group-hover:text-[var(--accent)] group-hover:bg-[var(--accent-subtle)] transition-all duration-200">
+              <div className="flex flex-col items-center justify-center text-zinc-600 group-hover:text-[var(--accent)] group-hover:bg-[var(--accent-subtle)] transition-all duration-200" style={{ height: "100%" }}>
                 <span className="text-5xl leading-none group-hover:scale-110 transition-transform duration-200 mb-1">＋</span>
-              </div>
-              {/* Text area — same height as the manga-card info block */}
-              <div className="p-3 flex flex-col" style={{ minHeight: '5.25rem', background: 'var(--card-bg)' }}>
-                <p className="text-sm font-semibold text-zinc-500 group-hover:text-[var(--accent)] transition-colors leading-snug" style={{ minHeight: '2.625rem' }}>
-                  Add manga
-                </p>
-                <p className="text-xs text-zinc-600 mt-1">Browse Discover →</p>
+                <span className="text-sm leading-none group-hover:scale-110 transition-transform duration-200 mb-1">Add Manga</span>
               </div>
             </div>
           </Link>
