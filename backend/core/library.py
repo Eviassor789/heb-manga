@@ -558,17 +558,15 @@ async def upload_chapter_files(
         for p in page_pngs:
             img = _Img.open(p).convert("RGB")
             buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=75, optimize=True, subsampling=2)
+            img.save(buf, format="JPEG", quality=65, optimize=True, subsampling=2)
             (pages_dir / f"{p.stem}.jpg").write_bytes(buf.getvalue())
 
     page_paths = sorted(pages_dir.glob("*.jpg"))
     page_count = len(page_paths)
 
-    pdf_bytes   = pdf_path.read_bytes()
-    pdf_key     = f"chapters/{mangadex_id}/compressed.pdf"
-    pdf_url     = await _upload_bytes(pdf_key, pdf_bytes, "application/pdf")
-    pdf_size_kb = len(pdf_bytes) // 1024
-    log.info("[library] Uploaded PDF (%d KB) → %s", pdf_size_kb, pdf_url)
+    # PDF size for stats only — we don't upload it to R2 (reader uses pages/ only)
+    pdf_size_kb = int(pdf_path.stat().st_size / 1024) if pdf_path.exists() else 0
+    pdf_url     = ""   # not stored in R2; download served from local disk via /api/jobs/{id}/download
 
     pages_key_prefix = f"chapters/{mangadex_id}/pages"
     sem = asyncio.Semaphore(_UPLOAD_CONCURRENCY)

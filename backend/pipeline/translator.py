@@ -180,6 +180,21 @@ Return ONLY valid JSON in exactly this structure — no other text:
 """
 
 # ---------------------------------------------------------------------------
+# Per-job config  (written by main.py at job creation time)
+# ---------------------------------------------------------------------------
+
+def _load_job_config(job_dir: Path) -> dict:
+    """Read job_config.json for the user-supplied Gemini API key (if any)."""
+    p = job_dir / "job_config.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+# ---------------------------------------------------------------------------
 # Lazy client singleton (created once, reused for all pages)
 # ---------------------------------------------------------------------------
 
@@ -279,6 +294,10 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
     """
     await emit({"stage": "translate", "status": "running"})
 
+    # Read per-job API key (set by the user in the browser, saved by main.py)
+    job_config    = _load_job_config(job_dir)
+    user_api_key: str | None = job_config.get("gemini_api_key") or None
+
     detection_dir   = job_dir / "detection"
     glossary        = _load_glossary(job_dir)
     genders         = _load_genders(job_dir)
@@ -336,7 +355,8 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
             for page_attempt in range(1, _MAX_PAGE_RETRIES + 2):  # +2 → 1 initial + N retries
                 try:
                     translations, glossary_updates, gender_updates, page_tokens = \
-                        await _translate_page(translatable, glossary_snapshot, genders_snapshot)
+                        await _translate_page(translatable, glossary_snapshot, genders_snapshot,
+                                              user_api_key=user_api_key)
                     page_succeeded = True
                     break
                 except Exception as exc:
@@ -454,9 +474,10 @@ _MAX_PAGE_RETRIES    = 3   # retries when the ENTIRE page call fails (network/AP
 
 
 async def _translate_page(
-    regions:  list[dict],
-    glossary: dict[str, str],
-    genders:  dict[str, str],
+    regions:      list[dict],
+    glossary:     dict[str, str],
+    genders:      dict[str, str],
+    user_api_key: str | None = None,
 ) -> tuple[list[dict], dict[str, str], dict[str, str], dict[str, int]]:
     """
     Send one page's regions to Gemini.
@@ -471,8 +492,12 @@ async def _translate_page(
     is retried up to _MAX_RETRY_ATTEMPTS times so blank bubbles are minimised.
     """
     from google.genai import types  # noqa: PLC0415
+    from google import genai       # noqa: PLC0415
 
-    client = await _get_client()
+    if user_api_key:
+        client = genai.Client(api_key=user_api_key)
+    else:
+        client = await _get_client()
     model  = os.getenv("GEMINI_MODEL", _DEFAULT_MODEL).strip()
 
     config = types.GenerateContentConfig(

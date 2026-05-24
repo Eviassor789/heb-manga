@@ -5,6 +5,8 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import MangaCover from '@/components/MangaCover'
 import Spinner from '@/components/Spinner'
+import ApiKeyModal from '@/components/ApiKeyModal'
+import { getApiHeaders, hasGeminiKey } from '@/lib/apiKeys'
 
 // ── Shared normalised types ────────────────────────────────────────────────────
 
@@ -172,6 +174,10 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
   const [currentBatch, setCurrentBatch] = useState(0)
   const [translating,  setTranslating]  = useState<string | null>(null)
 
+  // ── API key gate ──────────────────────────────────────────────────────────
+  const [keyGateOpen, setKeyGateOpen] = useState(false)
+  const [pendingCh,   setPendingCh]   = useState<NormalizedChapter | null>(null)
+
   // ── Phase 1: fetch series metadata ────────────────────────────────────────
 
   useEffect(() => {
@@ -293,7 +299,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
     try {
       const res  = await fetch('/api/jobs/from-url', {
         method:  'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getApiHeaders() },
         body:    JSON.stringify({ url: ch.translateUrl, data_saver: false }),
       })
       const data = await res.json()
@@ -426,7 +432,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
                       {i > 0 && <span className="text-zinc-700"> · </span>}
                       <Link
                         href={`/discover?q=${encodeURIComponent(tag)}`}
-                        className="hover:text-[#e4b7e3] transition-colors"
+                        className="hover:text-pink-soft transition-colors"
                       >
                         {tag}
                       </Link>
@@ -444,7 +450,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
                       style={{
                         background: 'var(--card-bg)',
                         border:     '1px solid var(--card-border)',
-                        color:      '#e4b7e3',
+                        color:      'var(--pink-soft)',
                       }}
                     >
                       {tag}
@@ -464,13 +470,13 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
           <div className="flex flex-wrap gap-4 text-sm">
             {!chapLoading && translatedCount > 0 && (
               <div className="flex items-center gap-1.5">
-                <span className="font-bold" style={{ color: '#e4b7e3' }}>{translatedCount}</span>
+                <span className="font-bold" style={{ color: 'var(--pink-soft)' }}>{translatedCount}</span>
                 <span className="text-zinc-500">chapters in Hebrew</span>
               </div>
             )}
             {!chapLoading && (
               <div className="flex items-center gap-1.5">
-                <span className="font-bold" style={{ color: '#e4b7e3' }}>{chapters.length}</span>
+                <span className="font-bold" style={{ color: 'var(--pink-soft)' }}>{chapters.length}</span>
                 <span className="text-zinc-500">total chapters</span>
               </div>
             )}
@@ -479,7 +485,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
               target="_blank"
               rel="noopener noreferrer"
               className="text-zinc-500 transition-colors text-sm"
-              style={{ color: '#e4b7e3'}}
+              style={{ color: 'var(--pink-soft)' }}
             >
               {source === 'weebcentral' ? 'WeebCentral' : 'MangaDex'} ↗
             </a>
@@ -601,7 +607,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
 
                 {/* Chapter info */}
                 <div className="flex-1 min-w-0">
-                  <p className={`text-sm font-medium truncate transition-colors group-hover:text-[#e4b7e3] ${isTranslated ? 'text-zinc-200' : 'text-zinc-400'}`}>
+                  <p className={`text-sm font-medium truncate transition-colors group-hover:text-pink-soft ${isTranslated ? 'text-zinc-200' : 'text-zinc-400'}`}>
                     {ch.label}
                   </p>
                   {(ch.pages || ch.publishAt) && (
@@ -619,23 +625,44 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
 
                 {/* Action buttons */}
                 {isTranslated && libEntry ? (
-                  /* ── Translated: read in our reader ── */
-                  <Link
-                    href={`/library/${libEntry.id}`}
-                    className="shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors"
-                    style={{
-                      background: 'rgba(34,197,94,0.12)',
-                      border:     '1px solid rgba(34,197,94,0.3)',
-                      color:      '#4ade80',
-                    }}
-                  >
-                    ✓ Read Hebrew
-                  </Link>
+                  /* ── Translated: read in our reader + keep external link ── */
+                  <div className="shrink-0 flex items-center gap-1.5">
+                    <Link
+                      href={`/library/${libEntry.id}`}
+                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors"
+                      style={{
+                        background: 'rgba(34,197,94,0.12)',
+                        border:     '1px solid rgba(34,197,94,0.3)',
+                        color:      '#4ade80',
+                      }}
+                    >
+                      ✓ Read Hebrew
+                    </Link>
+                    {ch.externalUrl && (
+                      <a
+                        href={ch.externalUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="flex items-center px-2.5 py-1.5 rounded-lg text-xs transition-all text-zinc-500 hover:text-zinc-200"
+                        style={{ border: '1px solid var(--card-border)' }}
+                        title={`Read on ${source === 'weebcentral' ? 'WeebCentral' : 'MangaDex'}`}
+                      >
+                        ↗
+                      </a>
+                    )}
+                  </div>
                 ) : (
                   /* ── Not translated: translate + external read ── */
                   <div className="shrink-0 flex items-center gap-1.5">
                     <button
-                      onClick={() => handleTranslate(ch)}
+                      onClick={() => {
+                        if (!hasGeminiKey()) {
+                          setPendingCh(ch)
+                          setKeyGateOpen(true)
+                        } else {
+                          handleTranslate(ch)
+                        }
+                      }}
                       disabled={isBusy || translating !== null}
                       className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                       style={{
@@ -669,6 +696,19 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
           })}
         </div>
       )}
+
+      {/* API key gate — shown when user tries to translate without a key */}
+      <ApiKeyModal
+        open={keyGateOpen}
+        onClose={() => { setKeyGateOpen(false); setPendingCh(null) }}
+        onSave={() => {/* NavBar refreshes its own state on mount */}}
+        onConfirm={() => {
+          setKeyGateOpen(false)
+          const ch = pendingCh
+          setPendingCh(null)
+          if (ch) handleTranslate(ch)
+        }}
+      />
 
     </main>
   )

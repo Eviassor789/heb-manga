@@ -11,6 +11,10 @@
   --card-bg:       rgba(255, 255, 255, 0.03);
   --card-border:   rgba(139, 92, 246, 0.12);
   --card-border-hover: rgba(139, 92, 246, 0.35);
+
+  /* ── Soft pink — secondary accent, hover titles, stats numbers, genre tags ── */
+  /* Change this one value and every pink element updates site-wide.             */
+  --pink-soft: #e4b7e3;
 }
 
 @layer base {

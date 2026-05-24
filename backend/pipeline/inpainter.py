@@ -146,21 +146,20 @@ async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
 
 _modal_inpaint_fn = None   # cached after first lookup
 
-async def _inpaint_page_modal(page_path: Path, mask_path: Path, out_path: Path) -> None:
-    """Send one page + mask to Modal GPU for LaMa inpainting."""
-    import asyncio, base64, modal
 
-    img_bytes = page_path.read_bytes()
+async def _inpaint_page_modal(page_path: Path, mask_path: Path, out_path: Path) -> None:
+    """Send one page + mask to the server's Modal GPU deployment for LaMa inpainting."""
+    import base64, modal
+    global _modal_inpaint_fn
 
     if not mask_path.exists():
-        import shutil
         shutil.copy2(page_path, out_path)
         return
 
-    global _modal_inpaint_fn
     if _modal_inpaint_fn is None:
         _modal_inpaint_fn = modal.Function.from_name("hebrew-manga-translator", "inpaint_page")
 
+    img_bytes    = page_path.read_bytes()
     mask_b64     = base64.b64encode(mask_path.read_bytes()).decode()
     result_bytes = await asyncio.to_thread(_modal_inpaint_fn.remote, img_bytes, mask_b64)
     out_path.write_bytes(result_bytes)

@@ -18,9 +18,9 @@ from PIL import Image
 def build_compressed_pdf(
     output_dir: Path,
     dest: Path,
-    quality: int = 75,          # 75 is the sweet spot for manga: ~40–50 % smaller than 85,
-                                 # line art is still crisp, only smooth gradients show any
-                                 # subtle loss. Raise to 85 if quality complaints arise.
+    quality: int = 65,          # 65 % JPEG quality — good balance for manga.
+                                 # Line-art stays crisp; smooth-gradient panels are clean.
+                                 # Raise to 75 if quality complaints arise, lower to 50 to save more space.
     max_width: int = 1500,      # Downscale pages wider than this (manga is usually 1000–1800 px).
                                  # 1500 px is indistinguishable from the original at normal
                                  # reading sizes while meaningfully reducing file size.
@@ -29,8 +29,8 @@ def build_compressed_pdf(
     """
     Re-encode typeset output PNGs as JPEG and assemble a PDF.
 
-    Combined effect of quality=75 + max_width=1500 vs the old quality=85:
-      ~7 MB  →  ~3–4 MB per chapter, still looks great in the web reader.
+    Combined effect of quality=50 + max_width=1500:
+      ~7 MB  →  ~2 MB per chapter; still sharp for manga line-art in a browser reader.
 
     save_pages=True also writes individual JPEGs to output_dir/pages/NNN.jpg.
     These are uploaded to R2 so the web reader can show pages as plain <img>

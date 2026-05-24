@@ -212,23 +212,31 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
             </h2>
 
             {/* Genres — plain dot-separated text, pink */}
-            <p className="text-xs mb-2" style={{ minHeight: '1rem', color: '#e4b7e3' }}>
+            <p className="text-xs mb-2" style={{ minHeight: '1rem', color: 'var(--pink-soft)' }}>
               {slide.genres && slide.genres.length > 0 ? slide.genres.slice(0, 5).join(' · ') : ''}
             </p>
 
             {/* Chapter count — only the number is pink */}
             <p className="text-zinc-500 text-xs mt-1" style={{ minHeight: '1.25rem' }}>
               {slide.chapterCount != null
-                ? <><span style={{ color: '#e4b7e3' }}>{slide.chapterCount}</span>{` chapter${slide.chapterCount !== 1 ? 's' : ''} in Hebrew`}</>
+                ? <><span style={{ color: 'var(--pink-soft)' }}>{slide.chapterCount}</span>{` chapter${slide.chapterCount !== 1 ? 's' : ''} in Hebrew`}</>
                 : slide.description || ''}
             </p>
           </div>
 
           <div className="flex items-center gap-3 flex-wrap mt-4">
-            <Link href={slide.href} className="btn-primary px-6 py-2.5 text-sm">
+            <Link
+              href={slide.href}
+              className="btn-primary px-6 py-2.5 text-sm"
+              style={{ background: 'var(--pink-soft)', color: '#09090f', borderColor: 'transparent' }}
+            >
               Read Now →
             </Link>
-            <Link href={slide.href} className="btn-ghost px-5 py-2.5 text-sm">
+            <Link
+              href={slide.href}
+              className="px-5 py-2.5 text-sm font-medium rounded-xl transition-all duration-150 border border-pink-soft/40 hover:border-pink-soft"
+              style={{ color: 'var(--pink-soft)' }}
+            >
               Details
             </Link>
           </div>
@@ -296,7 +304,7 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
               style={{
                 width:      i === current ? '22px' : '6px',
                 height:     '6px',
-                background: i === current ? 'var(--accent)' : 'rgba(255,255,255,0.22)',
+                background: i === current ? 'var(--pink-soft)' : 'rgba(255,255,255,0.22)',
               }}
             />
           ))}
@@ -329,7 +337,7 @@ function RowSection({
     <section className="mb-10">
       {/* Row header */}
       <div className="flex items-center justify-between mb-4 px-4 sm:px-8 xl:px-32">
-        <h2 className="font-bold" style={{ fontSize: '23px', color: '#e4b7e3' }}>{title}</h2>
+        <h2 className="font-bold" style={{ fontSize: '23px', color: 'var(--pink-soft)' }}>{title}</h2>
         {href && hrefLabel && (
           <Link
             href={href}
@@ -361,7 +369,7 @@ function RowSection({
           style={{ scrollbarWidth: 'none' }}
         >
           {loading
-            ? Array.from({ length: 8 }).map((_, i) => (
+            ? Array.from({ length: 9 }).map((_, i) => (
                 <div key={i} className="w-36 sm:w-44 flex-shrink-0">
                   <SkeletonCard />
                 </div>
@@ -452,10 +460,13 @@ export default function HomePage() {
       .slice(0, 20)
   , [libraryChapters])
 
-  // Hero: library manga first (most chapters = most effort) → pad with MangaDex popular
+  // Carousel: always interleave ≤4 library slides with ≤4 MangaDex popular slides.
+  // lib[0] → md[0] → lib[1] → md[1] … so both sources appear throughout, never
+  // bunched at the start or used only as fallback padding.
+  const HERO_HALF = 4   // max slides from each source (total ≤ 8)
   const heroSlides = useMemo((): HeroSlide[] => {
-    // Library slides — sorted by chapter count descending
-    const libSlides: HeroSlide[] = librarySeries.slice(0, 10).map(s => ({
+    // Library slides — sorted by chapter count descending (most-effort first)
+    const libSlides: HeroSlide[] = librarySeries.slice(0, HERO_HALF).map(s => ({
       id:           s.manga_id,
       title:        s.manga_title,
       coverUrl:     s.cover_url,
@@ -467,20 +478,18 @@ export default function HomePage() {
       chapterCount: s.chapter_count,
     }))
 
-    if (libSlides.length >= 10) return libSlides
-
-    // Pad with MangaDex popular (genres come directly from their API response)
+    // MangaDex popular slides — exclude manga already in the library
     const libIds = new Set(librarySeries.map(s => s.manga_id))
     const mdSlides: HeroSlide[] = mdPopular
       .filter(m => !libIds.has(m.id))
-      .slice(0, 10 - libSlides.length)
+      .slice(0, HERO_HALF)
       .map(m => ({
         id:          m.id,
         title:       getMDTitle(m),
         coverUrl:    getMDCover(m),
-        description: '',
+        description: 'Trending · Translate to Hebrew',
         href:        `/manga/${m.id}`,
-        badge:       'MangaDex',
+        badge:       'Popular',
         badgeColor:  'orange' as const,
         genres:      m.attributes.tags
           .map(t => t.attributes.name['en'])
@@ -488,7 +497,14 @@ export default function HomePage() {
           .slice(0, 6),
       }))
 
-    return [...libSlides, ...mdSlides]
+    // Interleave: lib[0], md[0], lib[1], md[1], …
+    const blended: HeroSlide[] = []
+    const len = Math.max(libSlides.length, mdSlides.length)
+    for (let i = 0; i < len && blended.length < HERO_HALF * 2; i++) {
+      if (i < libSlides.length) blended.push(libSlides[i])
+      if (i < mdSlides.length && blended.length < HERO_HALF * 2) blended.push(mdSlides[i])
+    }
+    return blended
   }, [librarySeries, mdPopular, heroGenres])
 
   // ── Fetch genres for library hero slides ────────────────────────────────────
@@ -497,7 +513,7 @@ export default function HomePage() {
   useEffect(() => {
     if (librarySeries.length === 0) return
 
-    const heroLib = librarySeries.slice(0, 10)
+    const heroLib = librarySeries.slice(0, HERO_HALF)
 
     // WC library manga — backend returns tags[]
     const wcFetches = heroLib
@@ -564,18 +580,72 @@ export default function HomePage() {
           className="border-y py-3 px-4 text-center text-xs text-zinc-500"
           style={{ borderColor: 'var(--card-border)', background: 'rgba(255,255,255,0.015)' }}
         >
-          <span className="text-zinc-300 font-semibold">{totalChaps}</span> chapters
+          <span className="font-semibold" style={{ color: 'var(--pink-soft)' }}>{totalChaps}</span> chapters
           {' · '}
-          <span className="text-zinc-300 font-semibold">{totalSeries}</span> manga series
+          <span className="font-semibold" style={{ color: 'var(--pink-soft)' }}>{totalSeries}</span> manga series
           {' · '}translated to{' '}
-          <span className="font-semibold" style={{ color: 'var(--accent)' }}>Hebrew</span>
+          <span className="font-semibold" style={{ color: 'var(--pink-soft)' }}>Hebrew</span>
         </div>
       )}
 
       {/* ── Rows ── */}
       <div className="pt-8">
 
-        {/* Recently Translated */}
+        {/* 1. Continue Reading — most personal, highest re-engagement, always first */}
+        {continueReading.length > 0 && (
+          <RowSection title="Continue Reading">
+            {continueReading.map(p => (
+              <div key={p.manga_id} className="w-36 sm:w-44 flex-shrink-0">
+                <MangaCard
+                  href={`/library/${p.chapter_id}`}
+                  title={p.manga_title}
+                  coverUrl={p.cover_url}
+                  subtitle={p.chapter_num ? `Ch. ${p.chapter_num}` : 'Resume'}
+                />
+              </div>
+            ))}
+          </RowSection>
+        )}
+
+        {/* 2. Trending on WeebCentral — hot content users can translate right now */}
+        <RowSection
+          title="Trending Now — Translate It"
+          href="/discover"
+          hrefLabel="Discover →"
+          loading={wcLoading}
+          empty={wcFeatured.length === 0}
+        >
+          {wcFeatured.map(m => (
+            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
+              <MangaCard
+                href={`/weebcentral/${m.id}`}
+                title={m.title}
+                coverUrl={m.cover || null}
+              />
+            </div>
+          ))}
+        </RowSection>
+
+        {/* 3. Popular on MangaDex — second discovery pool */}
+        <RowSection
+          title="Popular on MangaDex"
+          href="/discover"
+          hrefLabel="Discover →"
+          loading={mdLoading}
+          empty={mdPopular.length === 0}
+        >
+          {mdPopular.map(m => (
+            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
+              <MangaCard
+                href={`/manga/${m.id}`}
+                title={getMDTitle(m)}
+                coverUrl={getMDCover(m)}
+              />
+            </div>
+          ))}
+        </RowSection>
+
+        {/* 4. Recently Translated — community freshness signal */}
         <RowSection
           title="Recently Translated"
           loading={libLoading}
@@ -593,7 +663,7 @@ export default function HomePage() {
           ))}
         </RowSection>
 
-        {/* Hebrew Library */}
+        {/* 5. Hebrew Library — the full archive, least time-sensitive */}
         <RowSection
           title="Hebrew Library"
           loading={libLoading}
@@ -629,60 +699,6 @@ export default function HomePage() {
               </div>
             )
           })}
-        </RowSection>
-
-        {/* Continue Reading */}
-        {continueReading.length > 0 && (
-          <RowSection title="History">
-            {continueReading.map(p => (
-              <div key={p.manga_id} className="w-36 sm:w-44 flex-shrink-0">
-                <MangaCard
-                  href={`/library/${p.chapter_id}`}
-                  title={p.manga_title}
-                  coverUrl={p.cover_url}
-                  subtitle={p.chapter_num ? `Ch. ${p.chapter_num}` : 'Resume'}
-                />
-              </div>
-            ))}
-          </RowSection>
-        )}
-
-        {/* WeebCentral Trending */}
-        <RowSection
-          title="Trending on WeebCentral"
-          href="/discover"
-          hrefLabel="Discover →"
-          loading={wcLoading}
-          empty={wcFeatured.length === 0}
-        >
-          {wcFeatured.map(m => (
-            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
-              <MangaCard
-                href={`/weebcentral/${m.id}`}
-                title={m.title}
-                coverUrl={m.cover || null}
-              />
-            </div>
-          ))}
-        </RowSection>
-
-        {/* MangaDex Popular */}
-        <RowSection
-          title="Popular on MangaDex"
-          href="/discover"
-          hrefLabel="Discover →"
-          loading={mdLoading}
-          empty={mdPopular.length === 0}
-        >
-          {mdPopular.map(m => (
-            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
-              <MangaCard
-                href={`/manga/${m.id}`}
-                title={getMDTitle(m)}
-                coverUrl={getMDCover(m)}
-              />
-            </div>
-          ))}
         </RowSection>
 
       </div>

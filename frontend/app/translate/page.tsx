@@ -8,6 +8,8 @@
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
 import Spinner from '@/components/Spinner'
+import ApiKeyModal from '@/components/ApiKeyModal'
+import { getApiHeaders, hasGeminiKey } from '@/lib/apiKeys'
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
 
@@ -71,6 +73,10 @@ export default function TranslatePage() {
   const [error,   setError]   = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
+  // ── API key gate ──────────────────────────────────────────────────────────
+  const [keyGateOpen,   setKeyGateOpen]   = useState(false)
+  const [pendingAction, setPendingAction] = useState<'url' | 'file' | null>(null)
+
   // ── URL preview ───────────────────────────────────────────────────────────
 
   useEffect(() => {
@@ -103,7 +109,8 @@ export default function TranslatePage() {
     setLoading(true); setError('')
     try {
       const res  = await fetch('/api/jobs/from-url', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...getApiHeaders() },
         body: JSON.stringify({ url: raw, data_saver: dataSaver }),
       })
       const data = await res.json()
@@ -122,7 +129,7 @@ export default function TranslatePage() {
     try {
       const form = new FormData()
       form.append('file', file)
-      const res  = await fetch('/api/jobs', { method: 'POST', body: form })
+      const res  = await fetch('/api/jobs', { method: 'POST', headers: getApiHeaders(), body: form })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail ?? 'Failed to start job.')
       router.push(`/jobs/${data.job_id}`)
@@ -130,6 +137,16 @@ export default function TranslatePage() {
       setError(e instanceof Error ? e.message : 'Something went wrong.')
       setLoading(false)
     }
+  }
+
+  // Gate wrappers — check for Gemini key before submitting
+  const handleTranslateUrl = () => {
+    if (!hasGeminiKey()) { setPendingAction('url');  setKeyGateOpen(true); return }
+    submitUrl()
+  }
+  const handleTranslateFile = () => {
+    if (!hasGeminiKey()) { setPendingAction('file'); setKeyGateOpen(true); return }
+    submitFile()
   }
 
   const onDrop = useCallback((e: React.DragEvent) => {
@@ -178,7 +195,7 @@ export default function TranslatePage() {
                 <input className={`input pr-8 ${inputBorderClass}`} type="text"
                   placeholder="https://mangadex.org/chapter/…" value={url}
                   onChange={e => { setUrl(e.target.value); setError('') }}
-                  onKeyDown={e => e.key === 'Enter' && !loading && submitUrl()}
+                  onKeyDown={e => e.key === 'Enter' && !loading && handleTranslateUrl()}
                   spellCheck={false} />
                 {urlValid === true  && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-green-500 text-sm">✓</span>}
                 {urlValid === false && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-red-500 text-sm">✗</span>}
@@ -264,11 +281,25 @@ export default function TranslatePage() {
 
         <button
           className="btn-primary w-full mt-6 flex items-center justify-center gap-2"
-          onClick={tab === 'url' ? submitUrl : submitFile}
+          onClick={tab === 'url' ? handleTranslateUrl : handleTranslateFile}
           disabled={loading || (tab === 'url' && urlValid === false)}>
           {loading ? <><Spinner size="sm" /> Starting…</> : <>Translate to Hebrew →</>}
         </button>
       </div>
+
+      {/* API key gate */}
+      <ApiKeyModal
+        open={keyGateOpen}
+        onClose={() => { setKeyGateOpen(false); setPendingAction(null) }}
+        onSave={() => {}}
+        onConfirm={() => {
+          setKeyGateOpen(false)
+          const action = pendingAction
+          setPendingAction(null)
+          if (action === 'url')  submitUrl()
+          if (action === 'file') submitFile()
+        }}
+      />
     </main>
   )
 }

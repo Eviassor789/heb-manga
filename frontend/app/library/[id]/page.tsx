@@ -195,7 +195,9 @@ export default function ReaderPage() {
       entries => {
         if (seekingRef.current) return
         for (const entry of entries) {
-          if (entry.isIntersecting) {
+          // Ignore 0-height elements — lazy images haven't loaded yet and
+          // some browsers treat them as "fully intersecting" (0% outside = 100% in).
+          if (entry.isIntersecting && entry.boundingClientRect.height > 0) {
             const idx = Number((entry.target as HTMLElement).dataset.page)
             if (!isNaN(idx)) setCurrentPage(idx)
           }
@@ -560,11 +562,7 @@ export default function ReaderPage() {
                   style={{
                     minWidth:   0,
                     height:     isHovered ? '10px' : barVisible ? '4px' : '3px',
-                    background: isRead
-                      ? 'var(--accent)'
-                      : isHovered
-                        ? 'rgba(139,92,246,0.5)'
-                        : 'rgba(63,63,70,0.7)',
+                    background: isRead ? 'var(--accent)' : 'rgba(63,63,70,0.7)',
                     boxShadow:  isRead && isHovered ? '0 0 6px var(--accent-glow)' : undefined,
                   }}
                 />
@@ -600,7 +598,7 @@ export default function ReaderPage() {
                 {chapter.manga_title}
               </p>
               {chapterLabel && (
-                <p className="text-[11px] truncate leading-tight" style={{ color: 'var(--accent)' }}>
+                <p className="text-[11px] truncate leading-tight" style={{ color: 'var(--pink-soft)' }}>
                   {chapterLabel}
                 </p>
               )}

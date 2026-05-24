@@ -47,6 +47,7 @@ _DEFAULT_MODEL = _BACKEND_DIR / "models" / "comic_text_detector" / "comictextdet
 # Requires:  pip install modal  +  modal token new  +  modal deploy modal_gpu.py
 _USE_MODAL = os.getenv("USE_MODAL", "false").lower() == "true"
 
+
 # ---------------------------------------------------------------------------
 # Singleton detector (thread-safe double-checked locking)
 # ---------------------------------------------------------------------------
@@ -111,6 +112,7 @@ async def detect(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     Returns the same pages list unchanged (pipeline chaining convention).
     """
     await emit({"stage": "detect", "status": "running"})
+
     detection_dir = job_dir / "detection"
     loop  = asyncio.get_running_loop()
     total = len(pages)
@@ -134,9 +136,10 @@ async def detect(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
 
 _modal_detect_fn = None   # cached after first lookup
 
+
 async def _detect_page_modal(page_path: Path, detection_dir: Path) -> None:
-    """Send one page to Modal GPU and write results to detection/ on disk."""
-    import asyncio, base64, json as _json, modal
+    """Send one page to the server's Modal GPU deployment and write results to detection/."""
+    import base64, json as _json, modal
     global _modal_detect_fn
 
     if _modal_detect_fn is None:
@@ -150,7 +153,6 @@ async def _detect_page_modal(page_path: Path, detection_dir: Path) -> None:
     mask_path.write_bytes(base64.b64decode(result["mask_b64"]))
 
     # ── Write detection JSON ──────────────────────────────────────────────────
-    # Deduplicate before persisting (Modal result is raw model output)
     deduped_regions = nms_regions(result["regions"])
     page_data = {
         "page":       page_path.name,

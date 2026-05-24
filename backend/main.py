@@ -7,7 +7,7 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -27,10 +27,10 @@ app = FastAPI(title="Hebrew Manga Translator API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=["*"],          # tightened per-origin in production via env var if needed
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=["*"],          # includes X-Gemini-Api-Key, X-Modal-Token-Id/Secret
 )
 
 JOBS_DIR = Path("data/jobs")
@@ -140,12 +140,35 @@ def _create_job_dirs(job_id: str) -> Path:
     return job_dir
 
 
+def _save_job_config(job_dir: Path, request: Request) -> None:
+    """
+    Persist per-job settings supplied by the client as request headers.
+
+    Stored fields:
+      gemini_api_key  — X-Gemini-Api-Key (user's Gemini key for OCR + translation)
+
+    The key lives only in job_config.json inside the job directory and is removed
+    when the job is deleted.  It is NEVER stored in any database.
+    GPU processing (Modal) and storage (R2/Supabase) always use the server's own keys.
+    """
+    config: dict = {}
+
+    gemini_key = request.headers.get("X-Gemini-Api-Key", "").strip()
+    if gemini_key:
+        config["gemini_api_key"] = gemini_key
+
+    (job_dir / "job_config.json").write_text(
+        json.dumps(config, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.post("/api/jobs", status_code=201)
-async def create_job(file: UploadFile = File(...)):
+async def create_job(request: Request, file: UploadFile = File(...)):
     """Accept a .pdf or .zip upload, spin up the translation pipeline."""
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
@@ -163,6 +186,7 @@ async def create_job(file: UploadFile = File(...)):
 
     job_id  = str(uuid.uuid4())
     job_dir = _create_job_dirs(job_id)
+    _save_job_config(job_dir, request)
 
     upload_path = job_dir / f"source{suffix}"
     upload_path.write_bytes(content)
@@ -174,7 +198,7 @@ async def create_job(file: UploadFile = File(...)):
 
 
 @app.post("/api/jobs/from-url", status_code=201)
-async def create_job_from_url(body: FetchChapterBody):
+async def create_job_from_url(request: Request, body: FetchChapterBody):
     """
     Download a MangaDex chapter by URL or UUID, then run the translation pipeline.
 
@@ -198,6 +222,7 @@ async def create_job_from_url(body: FetchChapterBody):
 
     job_id  = str(uuid.uuid4())
     job_dir = _create_job_dirs(job_id)
+    _save_job_config(job_dir, request)
 
     job_manager.register_job(job_id)
     asyncio.create_task(

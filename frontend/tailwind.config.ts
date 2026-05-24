@@ -7,6 +7,10 @@ const config: Config = {
   ],
   theme: {
     extend: {
+      colors: {
+        /* Maps to --pink-soft in globals.css — change once, updates everywhere */
+        'pink-soft': 'var(--pink-soft)',
+      },
       fontFamily: {
         sans: ['Inter', 'system-ui', 'sans-serif'],
         mono: ['JetBrains Mono', 'monospace'],

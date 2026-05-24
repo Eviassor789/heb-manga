@@ -70,19 +70,39 @@ _CROP_PAD = 8
 # here so ocr.py has no cross-module dependency)
 # ---------------------------------------------------------------------------
 
-_ocr_client     = None
+_ocr_client      = None
 _ocr_client_lock = threading.Lock()
 
 
-def _get_ocr_client():
+def _load_job_config(job_dir: Path) -> dict:
+    """Read job_config.json written by main.py at job creation time."""
+    p = job_dir / "job_config.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def _get_ocr_client(api_key: str | None = None):
+    """
+    Return a Gemini client.
+    - If api_key is provided (user-supplied key), create a fresh one-off client.
+    - Otherwise return the shared server-key singleton.
+    """
+    from google import genai  # noqa: PLC0415
+
+    if api_key:
+        return genai.Client(api_key=api_key)
+
     global _ocr_client
     if _ocr_client is None:
         with _ocr_client_lock:
             if _ocr_client is None:
-                from google import genai  # noqa: PLC0415
-                api_key = os.getenv("GEMINI_API_KEY", "").strip()
-                if api_key:
-                    _ocr_client = genai.Client(api_key=api_key)
+                server_key = os.getenv("GEMINI_API_KEY", "").strip()
+                if server_key:
+                    _ocr_client = genai.Client(api_key=server_key)
     return _ocr_client
 
 
@@ -136,6 +156,10 @@ async def ocr(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     loop  = asyncio.get_running_loop()
     total = len(pages)
 
+    # Read per-job API key (set by the user in the browser, saved by main.py)
+    job_config = _load_job_config(job_dir)
+    user_api_key: str | None = job_config.get("gemini_api_key") or None
+
     # Token accounting (Gemini Vision calls)
     tok_input = tok_output = tok_think = 0
 
@@ -146,8 +170,8 @@ async def ocr(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
             await emit({"stage": "ocr", "status": "running", "page": i, "total": total})
             continue
 
-        if _USE_GEMINI_OCR and _get_ocr_client() is not None:
-            page_tokens = await _ocr_page_gemini(page_path, json_path)
+        if _USE_GEMINI_OCR and _get_ocr_client(user_api_key) is not None:
+            page_tokens = await _ocr_page_gemini(page_path, json_path, api_key=user_api_key)
             tok_input  += page_tokens.get("input",  0)
             tok_output += page_tokens.get("output", 0)
             tok_think  += page_tokens.get("think",  0)
@@ -200,7 +224,7 @@ def _extract_ocr_tokens(response) -> dict[str, int]:
     }
 
 
-async def _ocr_page_gemini(page_path: Path, json_path: Path) -> dict[str, int]:
+async def _ocr_page_gemini(page_path: Path, json_path: Path, api_key: str | None = None) -> dict[str, int]:
     """
     Send all bubble crops for one page to Gemini Vision in a single call.
 
@@ -261,7 +285,7 @@ async def _ocr_page_gemini(page_path: Path, json_path: Path) -> dict[str, int]:
         f"Required region IDs: {valid_ids}"
     )))
 
-    client = _get_ocr_client()
+    client = _get_ocr_client(api_key)
     model  = os.getenv("GEMINI_MODEL", _DEFAULT_MODEL).strip()
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
@@ -298,7 +322,7 @@ async def _ocr_page_gemini(page_path: Path, json_path: Path) -> dict[str, int]:
             log.warning("[ocr] Gemini Vision missed IDs %s on %s — retrying",
                         missing, page_path.name)
             retry_texts, retry_tokens = await _gemini_retry(
-                img_bgr, page_data["regions"], missing, model, config
+                img_bgr, page_data["regions"], missing, model, config, api_key=api_key
             )
             id_to_text.update(retry_texts)
             for k, v in retry_tokens.items():
@@ -330,6 +354,7 @@ async def _gemini_retry(
     missing:  list[int],
     model:    str,
     config,
+    api_key:  str | None = None,
 ) -> tuple[dict[int, str | None], dict[str, int]]:
     """Re-send only the missed crops in a second Gemini Vision call.
 
@@ -366,7 +391,7 @@ async def _gemini_retry(
         '{"regions": [{"id": N, "source_text": "..."}]}'
     )))
 
-    client = _get_ocr_client()
+    client = _get_ocr_client(api_key)
     try:
         response = await call_with_backoff(
             lambda: client.aio.models.generate_content(
