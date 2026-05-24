@@ -16,13 +16,13 @@ export default function MangaCover({ src, alt, className = '' }: MangaCoverProps
   const [failed, setFailed] = useState(false)
 
   return (
-    <div className={`relative w-full aspect-[3/4] bg-zinc-800 overflow-hidden ${className}`}>
+    <div className={`relative w-full aspect-[2/3] bg-zinc-900 overflow-hidden ${className}`}>
       {src && !failed ? (
         // eslint-disable-next-line @next/next/no-img-element
         <img
           src={src}
           alt={alt}
-          className="absolute inset-0 w-full h-full object-cover transition-transform duration-500 group-hover:scale-105"
+          className="absolute inset-0 w-full h-full object-cover"
           loading="lazy"
           decoding="async"
           onError={() => setFailed(true)}

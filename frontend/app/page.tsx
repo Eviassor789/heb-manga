@@ -91,15 +91,6 @@ function getMDCover(m: MDManga): string | null {
   return `https://uploads.mangadex.org/covers/${m.id}/${rel.attributes.fileName}.512.jpg`
 }
 
-function getMDDesc(m: MDManga): string {
-  const tags = m.attributes.tags
-    .map(t => t.attributes.name['en'])
-    .filter(Boolean)
-    .slice(0, 5)
-    .join(' · ')
-  const d = m.attributes.description
-  return tags || d['en'] || Object.values(d)[0] || ''
-}
 
 function groupBySeries(chapters: LibraryChapter[]): MangaSeries[] {
   const map = new Map<string, MangaSeries>()
@@ -194,10 +185,10 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
       <div className="absolute inset-0 bg-gradient-to-t from-[#09090f] via-[#09090f]/10 to-transparent" />
 
       {/* Content */}
-      <div className="relative h-full max-w-7xl mx-auto px-6 sm:px-10 flex items-center gap-10">
+      <div className="relative h-full max-w-7xl mx-auto px-6 sm:px-10 flex items-center">
 
-        {/* Left text column */}
-        <div className="flex-1 min-w-0 max-w-xl" key={slide.id}>
+        {/* Left text column — constrained so it doesn't overlap the cover */}
+        <div className="min-w-0 max-w-lg xl:max-w-xl" key={slide.id}>
           <p className="text-[11px] font-semibold text-zinc-500 uppercase tracking-widest mb-3">
             ✦ HeManga Featured
           </p>
@@ -220,29 +211,15 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
               {slide.title}
             </h2>
 
-            {/* Genre tags */}
-            {slide.genres && slide.genres.length > 0 && (
-              <div className="flex flex-wrap gap-1.5 mb-2">
-                {slide.genres.slice(0, 5).map(g => (
-                  <span
-                    key={g}
-                    className="text-[10px] font-medium px-2 py-0.5 rounded-md"
-                    style={{
-                      background: 'rgba(10,5,20,0.75)',
-                      border:     '1px solid rgba(139,92,246,0.35)',
-                      color:      '#a78bfa',
-                    }}
-                  >
-                    {g}
-                  </span>
-                ))}
-              </div>
-            )}
+            {/* Genres — plain dot-separated text, pink */}
+            <p className="text-xs mb-2" style={{ minHeight: '1rem', color: '#e4b7e3' }}>
+              {slide.genres && slide.genres.length > 0 ? slide.genres.slice(0, 5).join(' · ') : ''}
+            </p>
 
-            {/* Chapter count (library) or placeholder for height */}
+            {/* Chapter count — only the number is pink */}
             <p className="text-zinc-500 text-xs mt-1" style={{ minHeight: '1.25rem' }}>
               {slide.chapterCount != null
-                ? `${slide.chapterCount} chapter${slide.chapterCount !== 1 ? 's' : ''} in Hebrew`
+                ? <><span style={{ color: '#e4b7e3' }}>{slide.chapterCount}</span>{` chapter${slide.chapterCount !== 1 ? 's' : ''} in Hebrew`}</>
                 : slide.description || ''}
             </p>
           </div>
@@ -257,26 +234,33 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
           </div>
         </div>
 
-        {/* Right: upright cover art — larger */}
-        {slide.coverUrl && (
-          <div
-            className="hidden md:block flex-shrink-0"
-            style={{ width: 'clamp(160px, 16vw, 240px)' }}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              key={slide.id + '-cover'}
-              src={slide.coverUrl}
-              alt={slide.title}
-              className="w-full rounded-xl object-cover animate-fade-in"
-              style={{
-                aspectRatio: '3/4',
-                boxShadow:   '0 24px 64px rgba(0,0,0,0.75), 0 0 0 1px var(--card-border-hover)',
-              }}
-            />
-          </div>
-        )}
       </div>
+
+      {/* Cover — absolutely pinned to the right edge, larger */}
+      {slide.coverUrl && (
+        <div
+          className="hidden md:block absolute"
+          style={{
+            right:     '20%',
+            top:       '50%',
+            transform: 'translateY(-50%)',
+            width:     'clamp(190px, 20vw, 350px)',
+            zIndex:    1,
+          }}
+        >
+          {/* eslint-disable-next-line @next/next/no-img-element */}
+          <img
+            key={slide.id + '-cover'}
+            src={slide.coverUrl}
+            alt={slide.title}
+            className="w-full rounded-xl object-cover animate-fade-in"
+            style={{
+              aspectRatio: '3/4',
+              boxShadow:   '0 24px 72px rgba(0,0,0,0.85), 0 0 0 1px var(--card-border-hover)',
+            }}
+          />
+        </div>
+      )}
 
       {/* Prev / Next arrows */}
       {slides.length > 1 && (
@@ -337,15 +321,15 @@ function RowSection({
 }) {
   const scrollRef = useRef<HTMLDivElement>(null)
   const scroll = (dir: number) =>
-    scrollRef.current?.scrollBy({ left: dir * 340, behavior: 'smooth' })
+    scrollRef.current?.scrollBy({ left: dir * 450, behavior: 'smooth' })
 
   if (!loading && empty) return null
 
   return (
     <section className="mb-10">
       {/* Row header */}
-      <div className="flex items-center justify-between mb-4 px-4 sm:px-8 max-w-7xl mx-auto">
-        <h2 className="text-base font-bold text-zinc-100">{title}</h2>
+      <div className="flex items-center justify-between mb-4 px-4 sm:px-8 xl:px-32">
+        <h2 className="font-bold" style={{ fontSize: '23px', color: '#e4b7e3' }}>{title}</h2>
         {href && hrefLabel && (
           <Link
             href={href}
@@ -356,25 +340,29 @@ function RowSection({
         )}
       </div>
 
-      {/* Scrollable container with hover arrows */}
+      {/* Scrollable container with full-height Netflix-style arrows */}
       <div className="relative group/row">
+
+        {/* Left arrow */}
         <button
           aria-label="Scroll left"
           onClick={() => scroll(-1)}
-          className="absolute left-1 top-1/2 -translate-y-1/2 z-10 w-8 h-8 rounded-full flex items-center justify-center text-zinc-300 hover:text-white opacity-0 group-hover/row:opacity-100 transition-opacity text-xl font-light"
-          style={{ background: 'rgba(9,9,15,0.92)', border: '1px solid rgba(255,255,255,0.1)' }}
+          className="absolute left-0 top-0 bottom-0 z-10 w-16 flex items-center justify-center opacity-0 group-hover/row:opacity-100 transition-opacity"
+          style={{ background: 'linear-gradient(to right, rgba(9,9,15,0.88) 0%, transparent 100%)' }}
         >
-          ‹
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="text-white">
+            <polyline points="15 18 9 12 15 6" />
+          </svg>
         </button>
 
         <div
           ref={scrollRef}
-          className="hide-scrollbar flex gap-3 overflow-x-auto px-4 sm:px-8 pb-2 max-w-7xl mx-auto"
+          className="hide-scrollbar flex gap-4 overflow-x-auto px-4 sm:px-8 xl:px-32 pb-2"
           style={{ scrollbarWidth: 'none' }}
         >
           {loading
             ? Array.from({ length: 8 }).map((_, i) => (
-                <div key={i} className="w-36 sm:w-40 flex-shrink-0">
+                <div key={i} className="w-36 sm:w-44 flex-shrink-0">
                   <SkeletonCard />
                 </div>
               ))
@@ -382,14 +370,18 @@ function RowSection({
           }
         </div>
 
+        {/* Right arrow */}
         <button
           aria-label="Scroll right"
           onClick={() => scroll(1)}
-          className="absolute right-1 top-1/2 -translate-y-1/2 z-10 w-8 h-8 rounded-full flex items-center justify-center text-zinc-300 hover:text-white opacity-0 group-hover/row:opacity-100 transition-opacity text-xl font-light"
-          style={{ background: 'rgba(9,9,15,0.92)', border: '1px solid rgba(255,255,255,0.1)' }}
+          className="absolute right-0 top-0 bottom-0 z-10 w-16 flex items-center justify-center opacity-0 group-hover/row:opacity-100 transition-opacity"
+          style={{ background: 'linear-gradient(to left, rgba(9,9,15,0.88) 0%, transparent 100%)' }}
         >
-          ›
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round" className="text-white">
+            <polyline points="9 18 15 12 9 6" />
+          </svg>
         </button>
+
       </div>
     </section>
   )
@@ -460,45 +452,28 @@ export default function HomePage() {
       .slice(0, 20)
   , [libraryChapters])
 
-  // Hero: WeebCentral featured first → library → MangaDex popular padding
+  // Hero: library manga first (most chapters = most effort) → pad with MangaDex popular
   const heroSlides = useMemo((): HeroSlide[] => {
-    // WeebCentral featured (up to 6 slides)
-    const wcSlides: HeroSlide[] = wcFeatured.slice(0, 6).map(m => ({
-      id:          m.id,
-      title:       m.title,
-      coverUrl:    m.cover || null,
-      description: '',
-      href:        `/weebcentral/${m.id}`,
-      badge:       'WeebCentral',
-      badgeColor:  'violet' as const,
-      genres:      heroGenres.get(m.id) ?? [],
+    // Library slides — sorted by chapter count descending
+    const libSlides: HeroSlide[] = librarySeries.slice(0, 10).map(s => ({
+      id:           s.manga_id,
+      title:        s.manga_title,
+      coverUrl:     s.cover_url,
+      description:  '',
+      href:         seriesHref(s.manga_id),
+      badge:        '✓ In Hebrew',
+      badgeColor:   'green' as const,
+      genres:       heroGenres.get(s.manga_id) ?? [],
+      chapterCount: s.chapter_count,
     }))
 
-    // Library manga (not already in WC slides, sorted by chapter count)
-    const wcIds = new Set(wcFeatured.map(m => m.id))
-    const libSlides: HeroSlide[] = librarySeries
-      .filter(s => !wcIds.has(s.manga_id))
-      .slice(0, 4)
-      .map(s => ({
-        id:           s.manga_id,
-        title:        s.manga_title,
-        coverUrl:     s.cover_url,
-        description:  '',
-        href:         seriesHref(s.manga_id),
-        badge:        '✓ In Hebrew',
-        badgeColor:   'green' as const,
-        genres:       heroGenres.get(s.manga_id) ?? [],
-        chapterCount: s.chapter_count,
-      }))
+    if (libSlides.length >= 10) return libSlides
 
-    const combined = [...wcSlides, ...libSlides]
-    if (combined.length >= 10) return combined.slice(0, 10)
-
-    // Pad with MangaDex popular (genres come from their tag list)
-    const usedIds = new Set(combined.map(s => s.id))
+    // Pad with MangaDex popular (genres come directly from their API response)
+    const libIds = new Set(librarySeries.map(s => s.manga_id))
     const mdSlides: HeroSlide[] = mdPopular
-      .filter(m => !usedIds.has(m.id))
-      .slice(0, 10 - combined.length)
+      .filter(m => !libIds.has(m.id))
+      .slice(0, 10 - libSlides.length)
       .map(m => ({
         id:          m.id,
         title:       getMDTitle(m),
@@ -513,37 +488,62 @@ export default function HomePage() {
           .slice(0, 6),
       }))
 
-    return [...combined, ...mdSlides]
-  }, [wcFeatured, librarySeries, mdPopular, heroGenres])
+    return [...libSlides, ...mdSlides]
+  }, [librarySeries, mdPopular, heroGenres])
 
-  // ── Fetch genres for hero slides (WC series → backend scrapes Tag(s) section) ─
+  // ── Fetch genres for library hero slides ────────────────────────────────────
+  // WC library manga → backend scrapes Tag(s). MD library manga → MD API or mdPopular.
 
   useEffect(() => {
-    if (wcFeatured.length === 0 && librarySeries.length === 0) return
+    if (librarySeries.length === 0) return
 
-    // Collect WC IDs: featured items + any WC-sourced library manga in the hero
-    const wcIds = new Set<string>()
-    wcFeatured.slice(0, 6).forEach(m => wcIds.add(m.id))
-    librarySeries.slice(0, 4).forEach(s => {
-      if (/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(s.manga_id)) wcIds.add(s.manga_id)
-    })
+    const heroLib = librarySeries.slice(0, 10)
 
-    Promise.all(
-      [...wcIds].map(id =>
-        fetch(`/api/weebcentral/series/${id}`)
+    // WC library manga — backend returns tags[]
+    const wcFetches = heroLib
+      .filter(s => /^[0-9A-HJKMNP-TV-Z]{26}$/i.test(s.manga_id))
+      .map(s =>
+        fetch(`/api/weebcentral/series/${s.manga_id}`)
           .then(r => r.json())
-          .then(d => ({ id, genres: (d.tags ?? []) as string[] }))
-          .catch(() => ({ id, genres: [] as string[] }))
+          .then(d => ({ id: s.manga_id, genres: (d.tags ?? []) as string[] }))
+          .catch(() => ({ id: s.manga_id, genres: [] as string[] }))
       )
-    ).then(results => {
+
+    // MD library manga not already in mdPopular
+    const mdPopularIds = new Set(mdPopular.map(m => m.id))
+    const mdFetches = heroLib
+      .filter(s => !/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(s.manga_id) && !mdPopularIds.has(s.manga_id))
+      .map(s =>
+        fetch(`https://api.mangadex.org/manga/${s.manga_id}`)
+          .then(r => r.json())
+          .then(d => ({
+            id: s.manga_id,
+            genres: ((d.data?.attributes?.tags ?? []) as { attributes: { name: Record<string,string> } }[])
+              .map(t => t.attributes.name['en']).filter(Boolean).slice(0, 6) as string[],
+          }))
+          .catch(() => ({ id: s.manga_id, genres: [] as string[] }))
+      )
+
+    // MD library manga already in mdPopular — extract inline (no fetch needed)
+    const mdPopularMap = new Map(mdPopular.map(m => [
+      m.id,
+      m.attributes.tags.map(t => t.attributes.name['en']).filter(Boolean).slice(0, 6) as string[],
+    ]))
+
+    Promise.all([...wcFetches, ...mdFetches]).then(results => {
       setHeroGenres(prev => {
         const next = new Map(prev)
+        // Inline MD popular genres
+        heroLib.forEach(s => {
+          if (mdPopularMap.has(s.manga_id)) next.set(s.manga_id, mdPopularMap.get(s.manga_id)!)
+        })
+        // Fetched genres
         results.forEach(r => { if (r.genres.length) next.set(r.id, r.genres) })
         return next
       })
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [wcFeatured.length, librarySeries.length])
+  }, [librarySeries.length, mdPopular.length])
 
   // Hero is ready once WC or library data arrives (whichever comes first)
   const heroLoading  = wcLoading && libLoading
@@ -575,39 +575,41 @@ export default function HomePage() {
       {/* ── Rows ── */}
       <div className="pt-8">
 
-        {/* Continue Reading */}
-        {continueReading.length > 0 && (
-          <RowSection title="🕐 History">
-            {continueReading.map(p => (
-              <div key={p.manga_id} className="w-36 sm:w-40 flex-shrink-0">
-                <MangaCard
-                  href={`/library/${p.chapter_id}`}
-                  title={p.manga_title}
-                  coverUrl={p.cover_url}
-                  subtitle={p.chapter_num ? `Ch. ${p.chapter_num}` : 'Resume'}
-                />
-              </div>
-            ))}
-          </RowSection>
-        )}
+        {/* Recently Translated */}
+        <RowSection
+          title="Recently Translated"
+          loading={libLoading}
+          empty={recentChapters.length === 0}
+        >
+          {recentChapters.map(ch => (
+            <div key={ch.id} className="w-36 sm:w-44 flex-shrink-0">
+              <MangaCard
+                href={`/library/${ch.id}`}
+                title={ch.manga_title}
+                coverUrl={ch.cover_url}
+                subtitle={ch.chapter_num ? `Ch. ${ch.chapter_num}` : (ch.chapter_title ?? 'Read')}
+              />
+            </div>
+          ))}
+        </RowSection>
 
         {/* Hebrew Library */}
         <RowSection
-          title="📚 Hebrew Library"
+          title="Hebrew Library"
           loading={libLoading}
           empty={librarySeries.length === 0}
         >
           {/* "+" add card */}
-          <div className="w-36 sm:w-40 flex-shrink-0 self-stretch">
+          <div className="w-36 sm:w-44 flex-shrink-0 self-stretch">
             <Link href="/discover" className="group block h-full">
               <div
                 className="rounded-xl border-2 border-dashed flex flex-col items-center justify-center gap-2 text-zinc-600 group-hover:text-[var(--accent)] group-hover:bg-[var(--accent-subtle)] transition-all duration-200 h-full"
-                style={{ borderColor: 'var(--card-border)', minHeight: '160px' }}
+                style={{ borderColor: 'var(--card-border)', minHeight: '220px' }}
                 onMouseEnter={e => (e.currentTarget.style.borderColor = 'var(--accent)')}
                 onMouseLeave={e => (e.currentTarget.style.borderColor = 'var(--card-border)')}
               >
                 <span className="text-4xl leading-none group-hover:scale-110 transition-transform duration-200">＋</span>
-                <span className="text-xs font-medium">Add</span>
+                <span className="text-xs font-medium">Add Manga</span>
               </div>
             </Link>
           </div>
@@ -615,7 +617,7 @@ export default function HomePage() {
           {librarySeries.map(s => {
             const src = getSource(s.manga_id)
             return (
-              <div key={s.manga_id} className="w-36 sm:w-40 flex-shrink-0">
+              <div key={s.manga_id} className="w-36 sm:w-44 flex-shrink-0">
                 <MangaCard
                   href={seriesHref(s.manga_id)}
                   title={s.manga_title}
@@ -629,34 +631,32 @@ export default function HomePage() {
           })}
         </RowSection>
 
-        {/* Recently Translated */}
-        <RowSection
-          title="🆕 Recently Translated"
-          loading={libLoading}
-          empty={recentChapters.length === 0}
-        >
-          {recentChapters.map(ch => (
-            <div key={ch.id} className="w-36 sm:w-40 flex-shrink-0">
-              <MangaCard
-                href={`/library/${ch.id}`}
-                title={ch.manga_title}
-                coverUrl={ch.cover_url}
-                subtitle={ch.chapter_num ? `Ch. ${ch.chapter_num}` : (ch.chapter_title ?? 'Read')}
-              />
-            </div>
-          ))}
-        </RowSection>
+        {/* Continue Reading */}
+        {continueReading.length > 0 && (
+          <RowSection title="History">
+            {continueReading.map(p => (
+              <div key={p.manga_id} className="w-36 sm:w-44 flex-shrink-0">
+                <MangaCard
+                  href={`/library/${p.chapter_id}`}
+                  title={p.manga_title}
+                  coverUrl={p.cover_url}
+                  subtitle={p.chapter_num ? `Ch. ${p.chapter_num}` : 'Resume'}
+                />
+              </div>
+            ))}
+          </RowSection>
+        )}
 
         {/* WeebCentral Trending */}
         <RowSection
-          title="🟣 Trending on WeebCentral"
+          title="Trending on WeebCentral"
           href="/discover"
           hrefLabel="Discover →"
           loading={wcLoading}
           empty={wcFeatured.length === 0}
         >
           {wcFeatured.map(m => (
-            <div key={m.id} className="w-36 sm:w-40 flex-shrink-0">
+            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
               <MangaCard
                 href={`/weebcentral/${m.id}`}
                 title={m.title}
@@ -668,14 +668,14 @@ export default function HomePage() {
 
         {/* MangaDex Popular */}
         <RowSection
-          title="🟠 Popular on MangaDex"
+          title="Popular on MangaDex"
           href="/discover"
           hrefLabel="Discover →"
           loading={mdLoading}
           empty={mdPopular.length === 0}
         >
           {mdPopular.map(m => (
-            <div key={m.id} className="w-36 sm:w-40 flex-shrink-0">
+            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
               <MangaCard
                 href={`/manga/${m.id}`}
                 title={getMDTitle(m)}

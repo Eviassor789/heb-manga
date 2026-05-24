@@ -58,7 +58,6 @@
   .manga-card:hover {
     border-color: var(--accent);
     box-shadow: 0 0 18px var(--accent-glow), 0 4px 24px rgba(0,0,0,0.6);
-    transform: translateY(-3px);
   }
 
   /* ── Primary button (violet) ── */

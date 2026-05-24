@@ -37,13 +37,13 @@ export default function MangaCard({
       <div className="p-3 flex flex-col" style={{ minHeight: '5.25rem' }}>
         {/* Title always reserves 2-line height */}
         <p
-          className="text-sm font-semibold text-zinc-100 line-clamp-2 leading-snug group-hover:text-white transition-colors"
-          style={{ minHeight: '2.625rem' }}   /* 2 × (0.875rem × 1.375 lh) ≈ 2.406rem; round up */
+          className="text-sm font-semibold text-zinc-100 line-clamp-2 leading-snug group-hover:text-[#e4b7e3] transition-colors"
+          style={{ minHeight: '2.625rem' }}
         >
           {title}
         </p>
-        <p className="text-xs text-zinc-500 mt-1 truncate">
-          {subtitle ?? ' ' /* non-breaking space keeps the row's height */}
+        <p className="text-xs text-zinc-500 mt-1 truncate group-hover:text-[#e4b7e3] transition-colors">
+          {subtitle ?? ' ' /* non-breaking space keeps the row height */}
         </p>
       </div>
     </div>
