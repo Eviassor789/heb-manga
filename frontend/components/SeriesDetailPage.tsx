@@ -7,6 +7,7 @@ import MangaCover from '@/components/MangaCover'
 import Spinner from '@/components/Spinner'
 import ApiKeyModal from '@/components/ApiKeyModal'
 import { getApiHeaders, hasGeminiKey } from '@/lib/apiKeys'
+import { cacheGet, cacheSet } from '@/lib/cache'
 
 // ── Shared normalised types ────────────────────────────────────────────────────
 
@@ -178,10 +179,15 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
   const [keyGateOpen, setKeyGateOpen] = useState(false)
   const [pendingCh,   setPendingCh]   = useState<NormalizedChapter | null>(null)
 
-  // ── Phase 1: fetch series metadata ────────────────────────────────────────
+  // ── Phase 1: fetch series metadata (cached 10 min) ────────────────────────
 
   useEffect(() => {
     if (!id) return
+    const metaKey = `series:meta:${source}:${id}`
+
+    const cached = cacheGet<SeriesInfo>(metaKey, 10 * 60_000)
+    if (cached) { setSeries(cached); setMetaLoading(false); return }
+
     setMetaLoading(true)
     setSeries(null)
     setMetaError(null)
@@ -210,15 +216,20 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
             externalUrl: d.url,
           }))
 
-    p.then(s => setSeries(s))
+    p.then(s => { cacheSet(metaKey, s); setSeries(s) })
       .catch(e => setMetaError(String(e)))
       .finally(() => setMetaLoading(false))
   }, [id, source])
 
-  // ── Phase 2: fetch & normalise chapters ──────────────────────────────────
+  // ── Phase 2: fetch & normalise chapters (cached 10 min) ──────────────────
 
   useEffect(() => {
     if (!id) return
+    const chapKey = `series:chapters:${source}:${id}`
+
+    const cached = cacheGet<NormalizedChapter[]>(chapKey, 10 * 60_000)
+    if (cached) { setChapters(cached); setChapLoading(false); return }
+
     setChapLoading(true)
     setChapters([])
 
@@ -260,34 +271,45 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
             }))
           )
 
-    p.then(chs => setChapters(chs))
+    p.then(chs => { cacheSet(chapKey, chs); setChapters(chs) })
       .catch(() => setChapters([]))
       .finally(() => setChapLoading(false))
   }, [id, source])
 
-  // ── Phase 3: fetch library hits ───────────────────────────────────────────
+  // ── Phase 3: fetch library hits (cached 2 min so new translations appear) ─
 
   useEffect(() => {
     if (!id) return
+    const libKey = `series:lib:${id}`
+
+    function buildMap(entries: { id: string; mangadex_id: string; chapter_num: string }[]) {
+      const map = new Map<string, LibraryEntry>()
+      for (const entry of entries) {
+        // MangaDex: keyed by chapter UUID stored in mangadex_id
+        if (entry.mangadex_id && !entry.mangadex_id.startsWith('wc:')) {
+          map.set(entry.mangadex_id, { id: entry.id })
+        }
+        // WeebCentral: keyed by chapter_num string
+        if (entry.chapter_num) map.set(entry.chapter_num, { id: entry.id })
+        // WeebCentral: keyed by bare ULID stripped from "wc:ULID"
+        if (entry.mangadex_id?.startsWith('wc:')) {
+          map.set(entry.mangadex_id.slice(3), { id: entry.id })
+        }
+      }
+      return map
+    }
+
+    // Restore from cache immediately (no loading spinner for lib badges)
+    const cachedEntries = cacheGet<{ id: string; mangadex_id: string; chapter_num: string }[]>(libKey, 2 * 60_000)
+    if (cachedEntries) { setLibMap(buildMap(cachedEntries)); return }
+
     fetch(`/api/library/manga/${id}`)
       .then(r => r.ok ? r.json() : { chapters: [] })
       .then(data => {
         const entries: { id: string; mangadex_id: string; chapter_num: string }[] =
           data.chapters ?? []
-        const map = new Map<string, LibraryEntry>()
-        for (const entry of entries) {
-          // MangaDex: keyed by chapter UUID stored in mangadex_id
-          if (entry.mangadex_id && !entry.mangadex_id.startsWith('wc:')) {
-            map.set(entry.mangadex_id, { id: entry.id })
-          }
-          // WeebCentral: keyed by chapter_num string
-          if (entry.chapter_num) map.set(entry.chapter_num, { id: entry.id })
-          // WeebCentral: keyed by bare ULID stripped from "wc:ULID"
-          if (entry.mangadex_id?.startsWith('wc:')) {
-            map.set(entry.mangadex_id.slice(3), { id: entry.id })
-          }
-        }
-        setLibMap(map)
+        cacheSet(libKey, entries)
+        setLibMap(buildMap(entries))
       })
       .catch(() => {/* library unreachable — show no badges */})
   }, [id])

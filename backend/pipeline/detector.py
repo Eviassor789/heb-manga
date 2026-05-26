@@ -134,6 +134,23 @@ async def detect(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     return pages
 
 
+# ---------------------------------------------------------------------------
+# Public per-page entrypoint (used by the parallel pipeline in main.py)
+# ---------------------------------------------------------------------------
+
+async def detect_one_page(page_path: Path, detection_dir: Path) -> None:
+    """
+    Run text detection on a single page.  Writes detection JSON + mask PNG.
+    Safe to call concurrently — the single-thread executor serialises CPU work
+    while the asyncio event loop can overlap async I/O from other stages.
+    """
+    loop = asyncio.get_running_loop()
+    if _USE_MODAL:
+        await _detect_page_modal(page_path, detection_dir)
+    else:
+        await loop.run_in_executor(_executor, _detect_page, page_path, detection_dir)
+
+
 _modal_detect_fn = None   # cached after first lookup
 
 

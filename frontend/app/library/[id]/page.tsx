@@ -2,6 +2,7 @@
 
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
+import { cacheGet, cacheSet } from '@/lib/cache'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -154,13 +155,17 @@ export default function ReaderPage() {
     if (el) el.scrollTop = 0
   }, [currentPage])
 
-  // ── Fetch chapter metadata ─────────────────────────────────────────────────
+  // ── Fetch chapter metadata (cached 30 min — immutable after translation) ───
 
   useEffect(() => {
     if (!id) return
+    const chKey = `reader:chapter:${id}`
+    const cached = cacheGet<Chapter>(chKey, 30 * 60_000)
+    if (cached) { setChapter(cached); setLoading(false); return }
+
     fetch(`/api/library/${id}`)
       .then(r => { if (!r.ok) throw new Error('Chapter not found'); return r.json() })
-      .then(data => { setChapter(data); setLoading(false) })
+      .then(data => { cacheSet(chKey, data); setChapter(data); setLoading(false) })
       .catch(err  => { setError(err.message); setLoading(false) })
   }, [id])
 

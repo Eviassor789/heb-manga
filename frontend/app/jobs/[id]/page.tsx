@@ -36,6 +36,9 @@ const STAGE_INFO: Record<string, { label: string; desc: string; icon: string; ve
   typeset:   { label: 'Typeset',   icon: '✍',  desc: 'Rendering Hebrew text with RTL support',  verb: 'Typesetting' },
 }
 
+// The 5 stages that run in parallel per-page (everything after download)
+const PIPELINE_STAGES: StageKey[] = ['detect', 'ocr', 'inpaint', 'translate', 'typeset']
+
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function makeInitialStages(): Record<string, StageState> {
@@ -65,6 +68,7 @@ export default function JobPage() {
   const [failedStage, setFailedStage] = useState<string | null>(null)
   const [chapterTitle, setChapterTitle] = useState<string | null>(null)
   const [done, setDone] = useState(false)
+  const [libraryTimedOut, setLibraryTimedOut] = useState(false)
   const [activity, setActivity] = useState<ActivityEntry[]>([])
   const [reconnectKey, setReconnectKey] = useState(0)
   const [resuming, setResuming] = useState(false)
@@ -80,8 +84,9 @@ export default function JobPage() {
 
   // Wall-clock timer (ticks every second while running)
   const [tick, setTick] = useState(0)
-  const jobStartRef = useRef<number>(Date.now())
-  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  const jobStartRef    = useRef<number>(Date.now())
+  const timerRef       = useRef<ReturnType<typeof setInterval>  | null>(null)
+  const fallbackTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   const addActivity = useCallback((stage: string, text: string) => {
     setActivity(prev => [...prev.slice(-29), { ts: Date.now(), stage, text }])
@@ -98,7 +103,6 @@ export default function JobPage() {
     // Connect directly to FastAPI — Next.js proxies buffer SSE responses
     // (Node.js fetch accumulates the body before streaming it through).
     // CORS is already enabled on the backend for http://localhost:3000.
-    // In production, point NEXT_PUBLIC_BACKEND_URL at your reverse proxy.
     const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'
     const es = new EventSource(`${backendUrl}/api/jobs/${id}/status`)
 
@@ -116,12 +120,15 @@ export default function JobPage() {
 
         // Library registration complete → navigate straight to the reader
         if (stage === 'library_ready' && data.library_id) {
+          // Clear the fallback timer — real event arrived in time
+          if (fallbackTimerRef.current) { clearTimeout(fallbackTimerRef.current); fallbackTimerRef.current = null }
           setLibraryId(data.library_id)
           addActivity('done', '📚 Chapter added to library — opening reader…')
           es.close()
           router.push(`/library/${data.library_id}`)
           return
         }
+
         // Accumulate Gemini costs — both OCR and translate stages emit a `cost` payload
         if (data.cost) {
           const incoming = data.cost
@@ -151,6 +158,7 @@ export default function JobPage() {
         if (stage === 'done') {
           setStages(prev => {
             const next = { ...prev }
+            // Mark any still-running stages as done (pipeline is fully complete)
             STAGE_ORDER.forEach(k => {
               if (next[k].status === 'running') next[k] = { ...next[k], status: 'done', finishedAt: Date.now() }
             })
@@ -159,8 +167,16 @@ export default function JobPage() {
           if (download_url) setDownloadUrl(download_url)
           setDone(true)
           clearInterval(timerRef.current!)
-          addActivity('done', '✓ Translation complete — PDF ready')
-          es.close()
+          addActivity('done', '✓ Translation complete — adding to library…')
+          // Do NOT close EventSource here — we must keep it open to receive
+          // the library_ready event that arrives ~1 second later.
+          // Start a 10-second fallback in case library_ready never arrives.
+          fallbackTimerRef.current = setTimeout(() => {
+            fallbackTimerRef.current = null
+            es.close()
+            setLibraryTimedOut(true)
+            addActivity('done', '⚠ Library registration timed out — download available below')
+          }, 10_000)
           return
         }
 
@@ -189,12 +205,10 @@ export default function JobPage() {
 
         setStages(prev => {
           const next = { ...prev }
-          // Finish any previously running stage (stage transition)
-          STAGE_ORDER.forEach(k => {
-            if (k !== stage && next[k].status === 'running') {
-              next[k] = { ...next[k], status: 'done', finishedAt: now }
-            }
-          })
+          // NOTE: Do NOT auto-complete other running stages here.
+          // The parallel pipeline allows multiple stages to be running at the
+          // same time. Only mark a stage done when the backend sends
+          // {status: "done"} for that specific stage.
           const existing = next[stage] ?? { status: 'waiting' }
           next[stage] = {
             ...existing,
@@ -225,6 +239,7 @@ export default function JobPage() {
     return () => {
       es.close()
       clearInterval(timerRef.current!)
+      if (fallbackTimerRef.current) { clearTimeout(fallbackTimerRef.current); fallbackTimerRef.current = null }
     }
   }, [id, reconnectKey, addActivity])
 
@@ -235,6 +250,7 @@ export default function JobPage() {
     setError(null)
     setFailedStage(null)
     setDone(false)
+    setLibraryTimedOut(false)
     setDownloadUrl(null)
     setActivity([])
     setGeminiCost(null)
@@ -276,16 +292,29 @@ export default function JobPage() {
   // ── Derived ─────────────────────────────────────────────────────────────────
 
   const totalElapsed = Date.now() - jobStartRef.current
-  const doneCount   = STAGE_ORDER.filter(k => stages[k].status === 'done').length
-  const overallPct  = done ? 100 : Math.round((doneCount / STAGE_ORDER.length) * 100 +
-    (() => {
-      const running = STAGE_ORDER.find(k => stages[k].status === 'running')
-      if (!running) return 0
-      const s = stages[running]
-      return (1 / STAGE_ORDER.length) * pct(s.page, s.total)
-    })())
 
+  // Total page count — whichever stage first reports it
+  const totalPages = stages.typeset?.total ?? stages.translate?.total ?? stages.detect?.total ?? null
+
+  // Pages fully done = typeset.page (last stage — a typeset page is end-to-end complete)
+  const pagesFullyDone = stages.typeset?.page ?? 0
+
+  // Overall progress: typeset page fraction is most meaningful (it's the last stage)
+  const overallPct = done ? 100 : (() => {
+    if (totalPages && totalPages > 0 &&
+        (stages.typeset?.status === 'running' || stages.typeset?.status === 'done')) {
+      return pct(stages.typeset.page, totalPages)
+    }
+    // Fall back to stage-completion fraction
+    const doneCount = STAGE_ORDER.filter(k => stages[k].status === 'done').length
+    return Math.round((doneCount / STAGE_ORDER.length) * 100)
+  })()
+
+  const runningStages = STAGE_ORDER.filter(k => stages[k].status === 'running')
+  const pipelineActive = PIPELINE_STAGES.some(k => stages[k].status !== 'waiting')
   const isRunning = !done && !error
+
+  const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'
 
   // ── Render ──────────────────────────────────────────────────────────────────
 
@@ -321,22 +350,109 @@ export default function JobPage() {
         {/* Overall progress bar */}
         <div className="space-y-1.5">
           <div className="flex justify-between text-xs text-zinc-500">
-            <span>{done ? 'Complete' : error ? 'Stopped' : `${overallPct}%`}</span>
+            <span>
+              {done
+                ? 'Complete'
+                : error
+                ? 'Stopped'
+                : totalPages
+                ? `${pagesFullyDone} / ${totalPages} pages done`
+                : `${overallPct}%`}
+            </span>
             <span className="tabular-nums">{fmt(tick > 0 || done ? totalElapsed : 0)}</span>
           </div>
           <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
             <div
               className={`h-full rounded-full transition-all duration-700 ease-out ${
-                done ? 'bg-green-500' : error ? 'bg-red-600' : 'bg-blue-500'
+                done ? 'bg-green-500' : error ? 'bg-red-600' : 'bg-[var(--accent)]'
               }`}
               style={{ width: `${overallPct}%` }}
             />
           </div>
-          <p className="text-xs text-zinc-600">
-            {doneCount} / {STAGE_ORDER.length} stages complete
-          </p>
+          {/* Parallel pipeline indicator */}
+          {runningStages.length > 1 && (
+            <p className="text-xs text-blue-400/70">
+              ⚡ {runningStages.length} stages running in parallel
+            </p>
+          )}
         </div>
       </div>
+
+      {/* Parallel pipeline strip — compact overview of the 5 per-page stages */}
+      {pipelineActive && (
+        <div className="w-full max-w-2xl mb-4 animate-fade-in">
+          <div className="card px-4 py-3">
+            <p className="text-xs font-semibold text-zinc-600 uppercase tracking-wide mb-2.5">
+              Per-page pipeline
+            </p>
+            <div className="flex gap-1.5">
+              {PIPELINE_STAGES.map(key => {
+                const s = stages[key]
+                const progress = pct(s.page, s.total)
+                const isActive = s.status === 'running' || s.status === 'done'
+                return (
+                  <div key={key} className="flex-1 min-w-0">
+                    <div className={`rounded-lg px-2 py-2 border transition-all duration-300 ${
+                      s.status === 'done'    ? 'bg-green-950/30 border-green-800/50' :
+                      s.status === 'running' ? 'bg-blue-950/40 border-blue-700/60' :
+                      s.status === 'error'   ? 'bg-red-950/30 border-red-800/50' :
+                                               'bg-zinc-900/40 border-zinc-800/40'
+                    }`}>
+                      {/* Status icon + page count */}
+                      <div className="flex items-center justify-between mb-1">
+                        <span className={`text-sm leading-none ${
+                          s.status === 'done'    ? 'text-green-400' :
+                          s.status === 'running' ? 'text-blue-300' :
+                          s.status === 'error'   ? 'text-red-400'  : 'text-zinc-600'
+                        }`}>
+                          {s.status === 'done'    ? '✓' :
+                           s.status === 'running' ? '⟳' :
+                           s.status === 'error'   ? '✗' :
+                           STAGE_INFO[key].icon}
+                        </span>
+                        {s.status === 'running' && s.page != null && (
+                          <span className="text-xs text-blue-400/80 tabular-nums font-mono">
+                            {s.page}
+                          </span>
+                        )}
+                        {s.status === 'done' && s.total != null && (
+                          <span className="text-xs text-green-600/80 tabular-nums font-mono">
+                            {s.total}
+                          </span>
+                        )}
+                      </div>
+
+                      {/* Stage name */}
+                      <p className={`text-xs truncate ${
+                        s.status === 'done'    ? 'text-zinc-500' :
+                        s.status === 'running' ? 'text-zinc-400' : 'text-zinc-600'
+                      }`}>
+                        {STAGE_INFO[key].label}
+                      </p>
+
+                      {/* Mini progress bar */}
+                      {isActive && (
+                        <div className="mt-1.5 h-1 bg-zinc-800 rounded-full overflow-hidden">
+                          {s.status === 'done' || (s.page != null && s.total != null) ? (
+                            <div
+                              className={`h-full rounded-full transition-all duration-500 ${
+                                s.status === 'done' ? 'bg-green-500' : 'bg-blue-500'
+                              }`}
+                              style={{ width: `${s.status === 'done' ? 100 : progress}%` }}
+                            />
+                          ) : (
+                            <div className="h-full w-1/2 bg-blue-500/50 rounded-full animate-pulse" />
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Stage list */}
       <div className="w-full max-w-2xl card p-2 mb-4 animate-slide-in">
@@ -383,8 +499,8 @@ export default function JobPage() {
         </div>
       )}
 
-      {/* Done panel — navigating to reader (or waiting for library_ready) */}
-      {done && !libraryId && (
+      {/* Done panel — waiting for library_ready (spinner) */}
+      {done && !libraryId && !libraryTimedOut && (
         <div className="w-full max-w-2xl mb-4 animate-fade-in">
           <div className="card p-5">
             <div className="flex items-center gap-3">
@@ -395,107 +511,142 @@ export default function JobPage() {
               </div>
               <Spinner />
             </div>
+            {downloadUrl && (
+              <a
+                href={`${backendUrl}${downloadUrl}`}
+                download
+                className="mt-3 block text-center btn-ghost text-sm py-2"
+              >
+                ⬇ Download PDF while waiting
+              </a>
+            )}
           </div>
         </div>
       )}
 
-      {/* Cost breakdown — shown while waiting, hidden after redirect */}
-      {done && downloadUrl && (
+      {/* Done panel — library registration timed out */}
+      {done && !libraryId && libraryTimedOut && (
         <div className="w-full max-w-2xl mb-4 animate-fade-in">
           <div className="card p-5">
-
-            {/* Unified cost breakdown */}
-            {(geminiCost || Object.keys(modalSeconds).length > 0) && (() => {
-              const totalModalSec = Object.values(modalSeconds).reduce((a, b) => a + b, 0)
-              const modalUsd  = totalModalSec * MODAL_T4_USD_PER_SEC
-              const geminiUsd = geminiCost?.usd ?? 0
-              const totalUsd  = modalUsd + geminiUsd
-              const totalIls  = totalUsd * ILS_PER_USD
-
-              return (
-                <div className="mt-1 rounded-xl bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
-                  <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wide mb-2">
-                    Chapter cost
-                  </p>
-
-                  {/* Total */}
-                  <div className="flex items-baseline gap-2 mb-3">
-                    <span className="text-2xl font-bold text-zinc-100">
-                      ₪{totalIls.toFixed(3)}
-                    </span>
-                    <span className="text-sm text-zinc-500">
-                      / ${totalUsd.toFixed(4)} USD
-                    </span>
-                  </div>
-
-                  {/* Per-service breakdown */}
-                  <div className="grid grid-cols-2 gap-2 mb-3">
-                    {/* Modal */}
-                    <div className="bg-zinc-900/60 rounded-lg px-3 py-2">
-                      <div className="flex items-center justify-between mb-1">
-                        <p className="text-xs text-zinc-400 font-medium">Modal GPU</p>
-                        <p className="text-xs text-zinc-300 font-mono tabular-nums">
-                          ${modalUsd.toFixed(4)}
-                        </p>
-                      </div>
-                      <p className="text-xs text-zinc-600">
-                        {totalModalSec.toFixed(0)}s wall-clock · T4 GPU
-                      </p>
-                      {Object.keys(modalSeconds).length > 0 && (
-                        <div className="mt-1.5 space-y-0.5">
-                          {(['detect','ocr','inpaint'] as const).map(s =>
-                            modalSeconds[s] != null ? (
-                              <div key={s} className="flex justify-between text-xs text-zinc-600">
-                                <span className="capitalize">{s}</span>
-                                <span className="font-mono">{modalSeconds[s].toFixed(0)}s</span>
-                              </div>
-                            ) : null
-                          )}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Gemini */}
-                    <div className="bg-zinc-900/60 rounded-lg px-3 py-2">
-                      <div className="flex items-center justify-between mb-1">
-                        <p className="text-xs text-zinc-400 font-medium">Gemini API</p>
-                        <p className="text-xs text-zinc-300 font-mono tabular-nums">
-                          ${geminiUsd.toFixed(4)}
-                        </p>
-                      </div>
-                      <p className="text-xs text-zinc-600">
-                        {geminiCost ? `${geminiCost.tokens.total.toLocaleString()} tokens` : '—'}
-                      </p>
-                      {geminiCost && (
-                        <div className="mt-1.5 space-y-0.5">
-                          <div className="flex justify-between text-xs text-zinc-600">
-                            <span>Input</span>
-                            <span className="font-mono">{geminiCost.tokens.input.toLocaleString()}</span>
-                          </div>
-                          <div className="flex justify-between text-xs text-zinc-600">
-                            <span>Output</span>
-                            <span className="font-mono">{geminiCost.tokens.output.toLocaleString()}</span>
-                          </div>
-                          {geminiCost.tokens.think > 0 && (
-                            <div className="flex justify-between text-xs text-zinc-600">
-                              <span>Thinking</span>
-                              <span className="font-mono">{geminiCost.tokens.think.toLocaleString()}</span>
-                            </div>
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-
-                  <p className="text-xs text-zinc-600 text-center">
-                    Modal T4 ~$1.00/hr (GPU+mem) · Gemini 2.5 Flash · ~₪{ILS_PER_USD}/USD
-                  </p>
-                </div>
-              )
-            })()}
+            <div className="flex items-start gap-3 mb-3">
+              <span className="text-3xl">✅</span>
+              <div className="flex-1">
+                <p className="font-semibold text-zinc-100">Translation complete!</p>
+                <p className="text-sm text-amber-400/80 mt-0.5">
+                  Library registration timed out. You can download the PDF below or check the library shortly.
+                </p>
+              </div>
+            </div>
+            {downloadUrl && (
+              <a
+                href={`${backendUrl}${downloadUrl}`}
+                download
+                className="block text-center btn-primary text-sm py-2"
+              >
+                ⬇ Download translated PDF
+              </a>
+            )}
+            <button
+              onClick={() => router.push('/')}
+              className="mt-2 block w-full text-center btn-ghost text-sm py-2"
+            >
+              Go to library
+            </button>
           </div>
         </div>
       )}
+
+      {/* Cost breakdown */}
+      {done && downloadUrl && (geminiCost || Object.keys(modalSeconds).length > 0) && (() => {
+        const totalModalSec = Object.values(modalSeconds).reduce((a, b) => a + b, 0)
+        const modalUsd  = totalModalSec * MODAL_T4_USD_PER_SEC
+        const geminiUsd = geminiCost?.usd ?? 0
+        const totalUsd  = modalUsd + geminiUsd
+        const totalIls  = totalUsd * ILS_PER_USD
+
+        return (
+          <div className="w-full max-w-2xl mb-4 animate-fade-in">
+            <div className="card p-5">
+              <div className="rounded-xl bg-zinc-800/50 border border-zinc-700/50 px-4 py-3">
+                <p className="text-xs font-semibold text-zinc-400 uppercase tracking-wide mb-2">
+                  Chapter cost
+                </p>
+
+                <div className="flex items-baseline gap-2 mb-3">
+                  <span className="text-2xl font-bold text-zinc-100">
+                    ₪{totalIls.toFixed(3)}
+                  </span>
+                  <span className="text-sm text-zinc-500">
+                    / ${totalUsd.toFixed(4)} USD
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-2 gap-2 mb-3">
+                  {/* Modal */}
+                  <div className="bg-zinc-900/60 rounded-lg px-3 py-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="text-xs text-zinc-400 font-medium">Modal GPU</p>
+                      <p className="text-xs text-zinc-300 font-mono tabular-nums">
+                        ${modalUsd.toFixed(4)}
+                      </p>
+                    </div>
+                    <p className="text-xs text-zinc-600">
+                      {totalModalSec.toFixed(0)}s wall-clock · T4 GPU
+                    </p>
+                    {Object.keys(modalSeconds).length > 0 && (
+                      <div className="mt-1.5 space-y-0.5">
+                        {(['detect', 'ocr', 'inpaint'] as const).map(s =>
+                          modalSeconds[s] != null ? (
+                            <div key={s} className="flex justify-between text-xs text-zinc-600">
+                              <span className="capitalize">{s}</span>
+                              <span className="font-mono">{modalSeconds[s].toFixed(0)}s</span>
+                            </div>
+                          ) : null
+                        )}
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Gemini */}
+                  <div className="bg-zinc-900/60 rounded-lg px-3 py-2">
+                    <div className="flex items-center justify-between mb-1">
+                      <p className="text-xs text-zinc-400 font-medium">Gemini API</p>
+                      <p className="text-xs text-zinc-300 font-mono tabular-nums">
+                        ${geminiUsd.toFixed(4)}
+                      </p>
+                    </div>
+                    <p className="text-xs text-zinc-600">
+                      {geminiCost ? `${geminiCost.tokens.total.toLocaleString()} tokens` : '—'}
+                    </p>
+                    {geminiCost && (
+                      <div className="mt-1.5 space-y-0.5">
+                        <div className="flex justify-between text-xs text-zinc-600">
+                          <span>Input</span>
+                          <span className="font-mono">{geminiCost.tokens.input.toLocaleString()}</span>
+                        </div>
+                        <div className="flex justify-between text-xs text-zinc-600">
+                          <span>Output</span>
+                          <span className="font-mono">{geminiCost.tokens.output.toLocaleString()}</span>
+                        </div>
+                        {geminiCost.tokens.think > 0 && (
+                          <div className="flex justify-between text-xs text-zinc-600">
+                            <span>Thinking</span>
+                            <span className="font-mono">{geminiCost.tokens.think.toLocaleString()}</span>
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <p className="text-xs text-zinc-600 text-center">
+                  Modal T4 ~$1.00/hr (GPU+mem) · Gemini 2.5 Flash · ~₪{ILS_PER_USD}/USD
+                </p>
+              </div>
+            </div>
+          </div>
+        )
+      })()}
 
       {/* Activity log */}
       {activity.length > 0 && (

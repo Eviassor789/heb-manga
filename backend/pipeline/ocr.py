@@ -210,6 +210,31 @@ async def ocr(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Public per-page entrypoint (used by the parallel pipeline in main.py)
+# ---------------------------------------------------------------------------
+
+async def ocr_one_page(
+    page_path:    Path,
+    detection_dir: Path,
+    user_api_key: str | None = None,
+) -> dict[str, int]:
+    """
+    Run OCR on a single page.  Updates the detection JSON in-place with source_text.
+    Returns token counts {input, output, think} (non-zero only for Gemini Vision path).
+    """
+    json_path = detection_dir / f"{page_path.stem}.json"
+    if not json_path.exists():
+        return {"input": 0, "output": 0, "think": 0}
+
+    loop = asyncio.get_running_loop()
+    if _USE_GEMINI_OCR and _get_ocr_client(user_api_key) is not None:
+        return await _ocr_page_gemini(page_path, json_path, api_key=user_api_key)
+    else:
+        await loop.run_in_executor(_executor, _ocr_page_easyocr, page_path, json_path)
+        return {"input": 0, "output": 0, "think": 0}
+
+
+# ---------------------------------------------------------------------------
 # Gemini Vision OCR  (primary path)
 # ---------------------------------------------------------------------------
 

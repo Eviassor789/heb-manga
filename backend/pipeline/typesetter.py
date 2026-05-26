@@ -229,6 +229,38 @@ async def typeset(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
+# Public per-page entrypoint (used by the parallel pipeline in main.py)
+# ---------------------------------------------------------------------------
+
+async def typeset_one_page(page_path: Path, job_dir: Path) -> None:
+    """
+    Render Hebrew text onto a single page and write it to output/.
+    PDF assembly is NOT performed here — call assemble_pdf() once all pages
+    have been typeset.
+    """
+    cleaned_dir   = job_dir / "cleaned"
+    detection_dir = job_dir / "detection"
+    output_dir    = job_dir / "output"
+    loop = asyncio.get_running_loop()
+
+    src = cleaned_dir / page_path.name
+    if not src.exists():
+        log.warning("[typesetter] cleaned/%s missing — using original.", page_path.name)
+        src = page_path
+
+    json_path = detection_dir / f"{page_path.stem}.json"
+    out_path  = output_dir    / page_path.name
+
+    await loop.run_in_executor(_executor, _typeset_page, src, json_path, out_path)
+
+
+async def assemble_pdf(job_dir: Path) -> None:
+    """Combine all typeset PNGs in output/ into output/result.pdf."""
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(_executor, _assemble_pdf, job_dir / "output")
+
+
+# ---------------------------------------------------------------------------
 # Per-page typesetting (runs in single-thread executor)
 # ---------------------------------------------------------------------------
 

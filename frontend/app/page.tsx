@@ -4,6 +4,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import Link from 'next/link'
 import MangaCard from '@/components/MangaCard'
 import SkeletonCard from '@/components/SkeletonCard'
+import { cacheGet, cacheSet } from '@/lib/cache'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -68,7 +69,17 @@ interface HeroSlide {
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 const MD_API      = 'https://api.mangadex.org'
-const ALL_RATINGS = ['safe', 'suggestive', 'erotica']
+// 'erotica' removed — filters out hentai-adjacent content while keeping
+// mature titles like Berserk (rated 'suggestive' on MangaDex).
+const ALL_RATINGS = ['safe', 'suggestive']
+
+// MangaDex tag UUIDs to exclude from all popular / search queries.
+// Harem & Reverse Harem are filtered by tag rather than content-rating
+// so that dark/violent manga with no sexual content are unaffected.
+const MD_EXCLUDED_TAGS = [
+  'aafb99d1-7f60-43fa-b75f-fc9502ce29c7', // Harem
+  '9438db5a-7e2a-4ac0-b39e-e0d95a34b8a8', // Reverse Harem
+]
 
 function seriesHref(manga_id: string): string {
   if (!manga_id) return '/discover'
@@ -398,20 +409,35 @@ function RowSection({
 // ── Main component ─────────────────────────────────────────────────────────────
 
 export default function HomePage() {
-  // ── State ───────────────────────────────────────────────────────────────────
-  const [libraryChapters, setLibraryChapters] = useState<LibraryChapter[]>([])
-  const [libLoading,       setLibLoading]       = useState(true)
+  // ── State — initialised from cache so back-navigation is instant ─────────────
 
-  const [wcFeatured, setWcFeatured] = useState<WCManga[]>([])
-  const [wcLoading,  setWcLoading]  = useState(true)
+  const [libraryChapters, setLibraryChapters] = useState<LibraryChapter[]>(
+    () => cacheGet<LibraryChapter[]>('home:library') ?? []
+  )
+  const [libLoading, setLibLoading] = useState(
+    () => !cacheGet('home:library')
+  )
 
-  const [mdPopular, setMdPopular] = useState<MDManga[]>([])
-  const [mdLoading, setMdLoading] = useState(true)
+  const [wcFeatured, setWcFeatured] = useState<WCManga[]>(
+    () => cacheGet<WCManga[]>('home:wc-featured', 10 * 60_000) ?? []
+  )
+  const [wcLoading, setWcLoading] = useState(
+    () => !cacheGet('home:wc-featured', 10 * 60_000)
+  )
+
+  const [mdPopular, setMdPopular] = useState<MDManga[]>(
+    () => cacheGet<MDManga[]>('home:md-popular', 10 * 60_000) ?? []
+  )
+  const [mdLoading, setMdLoading] = useState(
+    () => !cacheGet('home:md-popular', 10 * 60_000)
+  )
 
   const [continueReading, setContinueReading] = useState<ReadingProgress[]>([])
 
   // genres keyed by manga_id / WC ULID — fetched lazily for hero slides
-  const [heroGenres, setHeroGenres] = useState<Map<string, string[]>>(new Map())
+  const [heroGenres, setHeroGenres] = useState<Map<string, string[]>>(
+    () => cacheGet<Map<string, string[]>>('home:genres') ?? new Map()
+  )
 
   // ── Fetch all data in parallel ───────────────────────────────────────────────
 
@@ -422,32 +448,50 @@ export default function HomePage() {
       setContinueReading(JSON.parse(raw))
     } catch {}
 
-    // Library
+    // Library — short TTL (2 min) so new translations appear quickly.
+    // Always revalidate in the background even if we already showed cached data.
     fetch('/api/library')
       .then(r => r.json())
-      .then(d => setLibraryChapters(d.chapters ?? []))
+      .then(d => {
+        const chs = d.chapters ?? []
+        cacheSet('home:library', chs)
+        setLibraryChapters(chs)
+      })
       .catch(() => {})
       .finally(() => setLibLoading(false))
 
-    // WeebCentral featured
-    fetch('/api/weebcentral/featured')
-      .then(r => r.json())
-      .then(d => setWcFeatured(d.results ?? []))
-      .catch(() => {})
-      .finally(() => setWcLoading(false))
+    // WeebCentral featured — skip fetch when cache is still fresh (10 min TTL)
+    if (!cacheGet('home:wc-featured', 10 * 60_000)) {
+      fetch('/api/weebcentral/featured')
+        .then(r => r.json())
+        .then(d => {
+          const results = d.results ?? []
+          cacheSet('home:wc-featured', results)
+          setWcFeatured(results)
+        })
+        .catch(() => {})
+        .finally(() => setWcLoading(false))
+    }
 
-    // MangaDex popular
-    const mdUrl = new URL(`${MD_API}/manga`)
-    mdUrl.searchParams.set('limit', '24')
-    mdUrl.searchParams.set('includes[]', 'cover_art')
-    mdUrl.searchParams.set('availableTranslatedLanguage[]', 'en')
-    mdUrl.searchParams.set('order[followedCount]', 'desc')
-    ALL_RATINGS.forEach(r => mdUrl.searchParams.append('contentRating[]', r))
-    fetch(mdUrl.toString())
-      .then(r => r.json())
-      .then(d => setMdPopular(d.data ?? []))
-      .catch(() => {})
-      .finally(() => setMdLoading(false))
+    // MangaDex popular — skip fetch when cache is still fresh (10 min TTL)
+    if (!cacheGet('home:md-popular', 10 * 60_000)) {
+      const mdUrl = new URL(`${MD_API}/manga`)
+      mdUrl.searchParams.set('limit', '24')
+      mdUrl.searchParams.set('includes[]', 'cover_art')
+      mdUrl.searchParams.set('availableTranslatedLanguage[]', 'en')
+      mdUrl.searchParams.set('order[followedCount]', 'desc')
+      ALL_RATINGS.forEach(r => mdUrl.searchParams.append('contentRating[]', r))
+      MD_EXCLUDED_TAGS.forEach(id => mdUrl.searchParams.append('excludedTags[]', id))
+      fetch(mdUrl.toString())
+        .then(r => r.json())
+        .then(d => {
+          const popular = d.data ?? []
+          cacheSet('home:md-popular', popular)
+          setMdPopular(popular)
+        })
+        .catch(() => {})
+        .finally(() => setMdLoading(false))
+    }
   }, [])
 
   // ── Derived ──────────────────────────────────────────────────────────────────
@@ -555,6 +599,7 @@ export default function HomePage() {
         })
         // Fetched genres
         results.forEach(r => { if (r.genres.length) next.set(r.id, r.genres) })
+        cacheSet('home:genres', next)
         return next
       })
     })

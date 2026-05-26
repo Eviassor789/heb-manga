@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import uuid
 from pathlib import Path
@@ -395,8 +396,22 @@ async def _cleanup_intermediates(job_dir: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Shared pipeline steps (Steps 1-5 + done emit)
+# Pipelined orchestrator — per-page parallel pipeline (Steps 1–5)
 # ---------------------------------------------------------------------------
+
+# How many pages to process concurrently through the full pipeline.
+# Each "slot" runs detect→ocr→inpaint→translate→typeset independently, so
+# page N+1 can start detection while page N is still awaiting its OCR result.
+# Single-thread executors inside each module naturally serialise CPU-heavy
+# steps (YOLO detect, LaMa inpaint, Pillow typeset) while async steps
+# (Gemini OCR, Gemini translate) overlap with CPU work on other pages.
+#
+# Sensible values:
+#   3 (default) — good overlap without overwhelming local CPU/RAM
+#   1           — equivalent to the old sequential-stage approach
+#   5+          — useful with USE_MODAL=true (GPU parallelism) or fast hardware
+_PIPELINE_CONCURRENCY = max(1, int(os.getenv("PIPELINE_CONCURRENCY", "3")))
+
 
 async def _run_pipeline_steps(
     job_id:  str,
@@ -405,29 +420,168 @@ async def _run_pipeline_steps(
     emit,
 ) -> None:
     """
-    Run Steps 1-5 of the pipeline and emit the final 'done' event.
+    Run Steps 1–5 of the pipeline and emit the final 'done' event.
 
-    Called by both _run_pipeline (file upload) and _run_pipeline_from_url
-    (MangaDex download) after pages are already in original/.
+    Pages flow through detect → ocr → inpaint → translate → typeset in
+    parallel: while page N is awaiting its Gemini OCR response, page N+1 is
+    already running detection, and page N-1 may already be inpainting.
+
+    Concurrency is bounded by PIPELINE_CONCURRENCY (default 3) and, for
+    Gemini API calls, by TRANSLATION_CONCURRENCY (default 1 for free tier).
     """
-    # ── Step 1: Detect ─────────────────────────────────────────────────────
-    pages = await detector.detect(job_dir, pages, emit)
+    total = len(pages)
 
-    # ── Step 2: OCR ────────────────────────────────────────────────────────
-    pages = await ocr.ocr(job_dir, pages, emit)
+    # ── Per-job API key ─────────────────────────────────────────────────────
+    cfg_path = job_dir / "job_config.json"
+    job_cfg  = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    user_api_key: str | None = job_cfg.get("gemini_api_key") or None
 
-    # ── Step 3: Inpaint ────────────────────────────────────────────────────
-    pages = await inpainter.inpaint(job_dir, pages, emit)
+    # ── Shared translator state ─────────────────────────────────────────────
+    glossary      = translator._load_glossary(job_dir)
+    glossary_lock = asyncio.Lock()
 
-    # ── Step 4: Translate ──────────────────────────────────────────────────
-    pages = await translator.translate(job_dir, pages, emit)
+    # ── Concurrency controls ────────────────────────────────────────────────
+    # pipeline_sem: max concurrent in-flight page pipelines
+    # translate_sem: Gemini translate API concurrency (respects free-tier RPM)
+    pipeline_sem  = asyncio.Semaphore(_PIPELINE_CONCURRENCY)
+    translate_sem = asyncio.Semaphore(
+        max(1, int(os.getenv("TRANSLATION_CONCURRENCY", "1")))
+    )
 
-    # ── Step 5: Typeset ────────────────────────────────────────────────────
-    pages = await typesetter.typeset(job_dir, pages, emit)
+    # ── Accumulators shared across page coroutines ──────────────────────────
+    counters     = {s: 0 for s in ("detect", "ocr", "inpaint", "translate", "typeset")}
+    counter_lock = asyncio.Lock()
+
+    ocr_tokens = {"input": 0, "output": 0, "think": 0}
+    tr_tokens  = {"input": 0, "output": 0, "think": 0}
+    tokens_lock = asyncio.Lock()
+
+    modal_inpaint_secs = 0.0
+    modal_lock         = asyncio.Lock()
+
+    # Track which stages have had their initial "running" event emitted
+    stage_started: set[str] = set()
+    started_lock  = asyncio.Lock()
+
+    async def _emit_stage_start(stage: str) -> None:
+        async with started_lock:
+            if stage not in stage_started:
+                stage_started.add(stage)
+                await emit({"stage": stage, "status": "running"})
+
+    # Emit the first stage immediately so the frontend transitions right away
+    await emit({"stage": "detect", "status": "running"})
+    stage_started.add("detect")
+
+    # Pre-warm LaMa so the first inpaint page doesn't pay the model-load cost
+    # while detect/OCR for later pages are already queued up.
+    if not os.getenv("USE_MODAL", "false").lower() == "true":
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, inpainter._get_lama)
+
+    async def _process_page(page_path: Path) -> None:
+        nonlocal modal_inpaint_secs
+
+        async with pipeline_sem:
+            # ── Step 1: Detect ──────────────────────────────────────────────
+            await detector.detect_one_page(page_path, job_dir / "detection")
+            async with counter_lock:
+                counters["detect"] += 1
+                n = counters["detect"]
+            await emit({"stage": "detect", "status": "running", "page": n, "total": total})
+
+            # ── Step 2: OCR ─────────────────────────────────────────────────
+            await _emit_stage_start("ocr")
+            toks = await ocr.ocr_one_page(page_path, job_dir / "detection", user_api_key)
+            async with tokens_lock:
+                for k in toks:
+                    ocr_tokens[k] += toks[k]
+            async with counter_lock:
+                counters["ocr"] += 1
+                n = counters["ocr"]
+            await emit({"stage": "ocr", "status": "running", "page": n, "total": total})
+
+            # ── Step 3: Inpaint ─────────────────────────────────────────────
+            await _emit_stage_start("inpaint")
+            ms = await inpainter.inpaint_one_page(page_path, job_dir)
+            async with modal_lock:
+                modal_inpaint_secs += ms
+            async with counter_lock:
+                counters["inpaint"] += 1
+                n = counters["inpaint"]
+            await emit({"stage": "inpaint", "status": "running", "page": n, "total": total})
+
+            # ── Step 4: Translate (serialised by translate_sem) ─────────────
+            await _emit_stage_start("translate")
+            async with translate_sem:
+                toks = await translator.translate_one_page(
+                    page_path, job_dir, glossary, glossary_lock, user_api_key
+                )
+            async with tokens_lock:
+                for k in toks:
+                    tr_tokens[k] += toks[k]
+            async with counter_lock:
+                counters["translate"] += 1
+                n = counters["translate"]
+            await emit({"stage": "translate", "status": "running", "page": n, "total": total})
+
+            # ── Step 5: Typeset ─────────────────────────────────────────────
+            await _emit_stage_start("typeset")
+            await typesetter.typeset_one_page(page_path, job_dir)
+            async with counter_lock:
+                counters["typeset"] += 1
+                n = counters["typeset"]
+            await emit({"stage": "typeset", "status": "running", "page": n, "total": total})
+
+    # Run all page pipelines concurrently (bounded by pipeline_sem)
+    await asyncio.gather(*(_process_page(p) for p in pages))
+
+    # ── Emit stage "done" events with cost/metrics ──────────────────────────
+    await emit({"stage": "detect", "status": "done", "total_pages": total,
+                "modal_gpu_seconds": 0.0})
+
+    ocr_cost: dict | None = None
+    if sum(ocr_tokens.values()) > 0:
+        cost_usd = (
+            ocr_tokens["input"]  / 1_000_000 * ocr._PRICE_INPUT_PER_M +
+            ocr_tokens["output"] / 1_000_000 * ocr._PRICE_OUTPUT_PER_M +
+            ocr_tokens["think"]  / 1_000_000 * ocr._PRICE_THINK_PER_M
+        )
+        ocr_cost = {
+            "usd": round(cost_usd, 4),
+            "ils": round(cost_usd * ocr._ILS_PER_USD, 4),
+            "tokens": {**ocr_tokens, "total": sum(ocr_tokens.values())},
+        }
+    await emit({
+        "stage": "ocr", "status": "done", "total_pages": total,
+        "modal_gpu_seconds": 0,
+        **({"cost": ocr_cost} if ocr_cost else {}),
+    })
+
+    await emit({"stage": "inpaint", "status": "done", "total_pages": total,
+                "modal_gpu_seconds": round(modal_inpaint_secs, 2)})
+
+    tr_cost_usd = (
+        tr_tokens["input"]  / 1_000_000 * translator._PRICE_INPUT_PER_M +
+        tr_tokens["output"] / 1_000_000 * translator._PRICE_OUTPUT_PER_M +
+        tr_tokens["think"]  / 1_000_000 * translator._PRICE_THINK_PER_M
+    )
+    await emit({
+        "stage": "translate", "status": "done", "total_pages": total,
+        "cost": {
+            "usd": round(tr_cost_usd, 4),
+            "ils": round(tr_cost_usd * translator._ILS_PER_USD, 4),
+            "tokens": {**tr_tokens, "total": sum(tr_tokens.values())},
+        },
+    })
+
+    # Assemble final PDF after all pages are typeset
+    await typesetter.assemble_pdf(job_dir)
+    await emit({"stage": "typeset", "status": "done", "total_pages": total})
 
     await emit({
         "stage":        "done",
-        "total_pages":  len(pages),
+        "total_pages":  total,
         "download_url": f"/api/jobs/{job_id}/download",
     })
 
@@ -626,18 +780,25 @@ async def search_weebcentral(q: str = ""):
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
         try:
+            # Build params — excluded_tag works only for single-word capitalised
+            # tag names; multi-word tags (e.g. "Reverse Harem") cause WC to
+            # redirect to their /400 page regardless of encoding.
+            # "Harem" covers both Harem and Reverse-Harem series in practice.
+            wc_params: list[tuple[str, str]] = [
+                ("text",         q),
+                ("sort",         "Best Match"),
+                ("order",        "Descending"),
+                ("official",     "Any"),
+                ("anime",        "Any"),
+                ("adult",        "Any"),
+                ("display_mode", "Full Display"),
+                ("author",       ""),
+                ("excluded_tag", "Harem"),
+                ("excluded_tag", "Hentai"),
+            ]
             res = await client.get(
                 "https://weebcentral.com/search/data",
-                params={
-                    "text":         q,
-                    "sort":         "Best Match",
-                    "order":        "Descending",
-                    "official":     "Any",
-                    "anime":        "Any",
-                    "adult":        "Any",
-                    "display_mode": "Full Display",
-                    "author":       "",
-                },
+                params=wc_params,
                 headers={**_WC_HEADERS, "HX-Request": "true"},
             )
         except Exception as exc:
@@ -652,21 +813,38 @@ async def search_weebcentral(q: str = ""):
 @app.get("/api/weebcentral/featured")
 async def weebcentral_featured():
     """
-    Scrape WeebCentral's main page and return the first ~24 series from the
-    Hot Updates section so the discover page has something to show on load.
+    Return the latest-updated series from WeebCentral for the discover page.
+    Uses /search/data with adult=False so explicit content is excluded.
 
     Returns: { results: [{ id, title, cover, url }] }
     """
     import httpx
 
+    wc_params: list[tuple[str, str]] = [
+        ("text",         ""),
+        ("sort",         "Latest Updates"),
+        ("order",        "Descending"),
+        ("official",     "Any"),
+        ("anime",        "Any"),
+        ("adult",        "Any"),
+        ("display_mode", "Full Display"),
+        ("author",       ""),
+        ("excluded_tag", "Harem"),
+        ("excluded_tag", "Hentai"),
+    ]
+
     async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
         try:
-            res = await client.get("https://weebcentral.com/", headers=_WC_HEADERS)
+            res = await client.get(
+                "https://weebcentral.com/search/data",
+                params=wc_params,
+                headers={**_WC_HEADERS, "HX-Request": "true"},
+            )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"WeebCentral unreachable: {exc}")
 
     if not res.is_success:
-        raise HTTPException(status_code=502, detail="WeebCentral main page unavailable.")
+        raise HTTPException(status_code=502, detail="WeebCentral featured unavailable.")
 
     return {"results": _parse_wc_series(res.text, limit=24)}
 

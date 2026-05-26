@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from 'next/navigation'
 import MangaCard from '@/components/MangaCard'
 import SkeletonCard from '@/components/SkeletonCard'
 import Spinner from '@/components/Spinner'
+import { cacheGet, cacheSet } from '@/lib/cache'
 
 // ── MangaDex API types ─────────────────────────────────────────────────────────
 
@@ -32,8 +33,12 @@ interface WCManga {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-const MD_API    = 'https://api.mangadex.org'
-const ALL_RATINGS = ['safe', 'suggestive', 'erotica']
+const MD_API      = 'https://api.mangadex.org'
+const ALL_RATINGS = ['safe', 'suggestive']
+const MD_EXCLUDED_TAGS = [
+  'aafb99d1-7f60-43fa-b75f-fc9502ce29c7', // Harem
+  '9438db5a-7e2a-4ac0-b39e-e0d95a34b8a8', // Reverse Harem
+]
 
 function getMangaTitle(m: MDManga): string {
   const t = m.attributes.title
@@ -52,6 +57,7 @@ async function fetchMangaDex(extra: Record<string, string>): Promise<MDManga[]> 
   url.searchParams.set('includes[]', 'cover_art')
   url.searchParams.set('availableTranslatedLanguage[]', 'en')
   ALL_RATINGS.forEach(r => url.searchParams.append('contentRating[]', r))
+  MD_EXCLUDED_TAGS.forEach(id => url.searchParams.append('excludedTags[]', id))
   for (const [k, v] of Object.entries(extra)) url.searchParams.set(k, v)
   const res = await fetch(url.toString())
   if (!res.ok) throw new Error('MangaDex request failed')
@@ -104,23 +110,34 @@ function DiscoverContent() {
       .catch(() => {})
   }, [])
 
-  // ── MangaDex popular (load once) ─────────────────────────────────────────
+  // ── MangaDex popular (load once, cached 10 min) ───────────────────────────
 
   useEffect(() => {
+    const cached = cacheGet<MDManga[]>('discover:md-featured', 10 * 60_000)
+    if (cached) { setMdFeatured(cached); setMdFeatLoading(false); return }
+
     fetchMangaDex({ 'order[followedCount]': 'desc' })
-      .then(setMdFeatured)
+      .then(data => { cacheSet('discover:md-featured', data); setMdFeatured(data) })
       .catch(() => setError('Could not load MangaDex. Check your connection.'))
       .finally(() => setMdFeatLoading(false))
   }, [])
 
-  // ── WeebCentral featured (load when tab first activated) ─────────────────
+  // ── WeebCentral featured (load when tab first activated, cached 10 min) ──
 
   useEffect(() => {
     if (urlSrc !== 'weebcentral' || wcFeatLoaded) return
+
+    const cached = cacheGet<WCManga[]>('discover:wc-featured', 10 * 60_000)
+    if (cached) { setWcFeatured(cached); setWcFeatLoading(false); setWcFeatLoaded(true); return }
+
     setWcFeatLoading(true)
     fetch('/api/weebcentral/featured')
       .then(r => r.json())
-      .then(d => setWcFeatured(d.results ?? []))
+      .then(d => {
+        const results = d.results ?? []
+        cacheSet('discover:wc-featured', results)
+        setWcFeatured(results)
+      })
       .catch(() => {})
       .finally(() => { setWcFeatLoading(false); setWcFeatLoaded(true) })
   }, [urlSrc, wcFeatLoaded])
@@ -145,18 +162,27 @@ function DiscoverContent() {
       return
     }
 
-    // Run the search for whatever the URL says
+    // Run the search for whatever the URL says (cached 5 min per query+source)
+    const searchKey = `discover:search:${urlSrc}:${urlQ}`
     if (urlSrc === 'mangadex') {
+      const cached = cacheGet<MDManga[]>(searchKey, 5 * 60_000)
+      if (cached) { setMdResults(cached); return }
       setMdSrchLoading(true)
       fetchMangaDex({ title: urlQ, 'order[relevance]': 'desc' })
-        .then(setMdResults)
+        .then(data => { cacheSet(searchKey, data); setMdResults(data) })
         .catch(() => setMdResults([]))
         .finally(() => setMdSrchLoading(false))
     } else {
+      const cached = cacheGet<WCManga[]>(searchKey, 5 * 60_000)
+      if (cached) { setWcResults(cached); return }
       setWcSrchLoading(true)
       fetch(`/api/search/weebcentral?q=${encodeURIComponent(urlQ)}`)
         .then(r => r.json())
-        .then(d => setWcResults(d.results ?? []))
+        .then(d => {
+          const results = d.results ?? []
+          cacheSet(searchKey, results)
+          setWcResults(results)
+        })
         .catch(() => setWcResults([]))
         .finally(() => setWcSrchLoading(false))
     }

@@ -132,23 +132,10 @@ Translation rules
    each individual bubble.
 
 8. GENDERED HEBREW — critical for correctness.
-   Hebrew grammar is fully gendered. You MUST use the correct gender for every
-   pronoun, verb conjugation, and adjective that agrees with a character.
-
-   Use the supplied character_genders map (e.g. {"Gon": "male", "Biscuit": "female"})
-   to resolve ambiguous second-person "you / your / yourself":
-     • Addressing a MALE   → "אתה" / "שלך (זכר)" / "את עצמך"
-     • Addressing a FEMALE → "את"  / "שלך (נקבה)" / "את עצמך"
-   Also conjugate verbs and adjectives to match: רץ/רצה, חזק/חזקה, etc.
-
-   As you process each page, infer character genders from:
-   • third-person pronouns in narration (he/she/his/her)
-   • names that are culturally gendered
-   • how other characters refer to them
-   • any visual context clues in the dialogue
-
-   Report any gender you are confident about in "character_genders".
-   Use only "male" or "female" as values.
+   Hebrew grammar is fully gendered. Use the correct gender for every pronoun,
+   verb conjugation, and adjective.  Infer each character's gender from context
+   within this page (pronouns, names, how others address them) and apply it
+   consistently throughout your translations for this page.
 
 9. Do not include any explanation, commentary, or markdown in your response.
 
@@ -160,7 +147,6 @@ Output requirements (strictly enforced)
   If the source is illegible or ambiguous, transliterate it phonetically
   rather than returning an empty value.
 • Every proper noun / term you encounter must appear in "glossary_updates".
-• Report inferred or confirmed character genders in "character_genders".
 
 Output format
 ─────────────
@@ -172,9 +158,6 @@ Return ONLY valid JSON in exactly this structure — no other text:
   ],
   "glossary_updates": {
     "<English name / term>": "<Hebrew equivalent>"
-  },
-  "character_genders": {
-    "<Character name>": "male" | "female"
   }
 }\
 """
@@ -252,32 +235,6 @@ def _save_glossary(job_dir: Path, glossary: dict[str, str]) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Character gender helpers
-# ---------------------------------------------------------------------------
-
-def _genders_path(job_dir: Path) -> Path:
-    return job_dir / "character_genders.json"
-
-
-def _load_genders(job_dir: Path) -> dict[str, str]:
-    """Load the accumulated character→gender map for this job."""
-    path = _genders_path(job_dir)
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception:
-            return {}
-    return {}
-
-
-def _save_genders(job_dir: Path, genders: dict[str, str]) -> None:
-    _genders_path(job_dir).write_text(
-        json.dumps(genders, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-# ---------------------------------------------------------------------------
 # Public async entrypoint
 # ---------------------------------------------------------------------------
 
@@ -300,9 +257,7 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
 
     detection_dir   = job_dir / "detection"
     glossary        = _load_glossary(job_dir)
-    genders         = _load_genders(job_dir)
     glossary_lock   = asyncio.Lock()
-    genders_lock    = asyncio.Lock()
     completed       = 0
     completed_lock  = asyncio.Lock()
     total           = len(pages)
@@ -315,7 +270,7 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
     tok_think    = 0
 
     async def _process_page(page_path: Path) -> None:
-        nonlocal completed, glossary, genders, tok_input, tok_output, tok_think
+        nonlocal completed, glossary, tok_input, tok_output, tok_think
 
         async with sem:                         # respect concurrency limit
             json_path = detection_dir / f"{page_path.stem}.json"
@@ -337,25 +292,22 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
                                 "page": completed, "total": total})
                 return
 
-            # Snapshot both glossary and genders before the (potentially slow) API call
+            # Snapshot glossary before the (potentially slow) API call
             async with glossary_lock:
                 glossary_snapshot = dict(glossary)
-            async with genders_lock:
-                genders_snapshot = dict(genders)
 
             # Retry the entire page call on transient errors (network, API hiccup,
             # bad response body).  We wait a few seconds between attempts so a
             # brief service blip has time to recover.
             translations: list[dict] = []
             glossary_updates: dict[str, str] = {}
-            gender_updates: dict[str, str] = {}
             page_tokens: dict[str, int] = {"input": 0, "output": 0, "think": 0}
             page_succeeded = False
 
             for page_attempt in range(1, _MAX_PAGE_RETRIES + 2):  # +2 → 1 initial + N retries
                 try:
-                    translations, glossary_updates, gender_updates, page_tokens = \
-                        await _translate_page(translatable, glossary_snapshot, genders_snapshot,
+                    translations, glossary_updates, page_tokens = \
+                        await _translate_page(translatable, glossary_snapshot,
                                               user_api_key=user_api_key)
                     page_succeeded = True
                     break
@@ -403,20 +355,9 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
                     glossary.update(glossary_updates)
                     _save_glossary(job_dir, glossary)
 
-            # Merge character gender updates — only accept "male"/"female" values
-            valid_genders = {
-                name: g for name, g in gender_updates.items()
-                if g in ("male", "female")
-            }
-            if valid_genders:
-                async with genders_lock:
-                    genders.update(valid_genders)
-                    _save_genders(job_dir, genders)
-
             log.info(
-                "[translator] %s — translated %d region(s), %d new glossary term(s), "
-                "%d gender(s) confirmed.",
-                page_path.name, len(translations), len(glossary_updates), len(valid_genders),
+                "[translator] %s — translated %d region(s), %d new glossary term(s).",
+                page_path.name, len(translations), len(glossary_updates),
             )
             async with completed_lock:
                 completed += 1
@@ -457,6 +398,92 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
 
 
 # ---------------------------------------------------------------------------
+# Public per-page entrypoint (used by the parallel pipeline in main.py)
+# ---------------------------------------------------------------------------
+
+async def translate_one_page(
+    page_path:     Path,
+    job_dir:       Path,
+    glossary:      dict[str, str],
+    glossary_lock: asyncio.Lock,
+    user_api_key:  str | None = None,
+) -> dict[str, int]:
+    """
+    Translate a single page in isolation.
+
+    Designed to be called concurrently from the pipelined orchestrator in main.py.
+    Updates the shared *glossary* dict in-place under *glossary_lock* so every
+    page that starts after this one benefits from newly discovered proper nouns.
+
+    Returns accumulated token counts {input, output, think}.
+    """
+    detection_dir = job_dir / "detection"
+    json_path     = detection_dir / f"{page_path.stem}.json"
+
+    if not json_path.exists():
+        return {"input": 0, "output": 0, "think": 0}
+
+    page_data    = json.loads(json_path.read_text(encoding="utf-8"))
+    translatable = _get_translatable(page_data["regions"])
+
+    if not translatable:
+        return {"input": 0, "output": 0, "think": 0}
+
+    # Snapshot the glossary under lock so we capture every term added by
+    # pages that completed before us (serialised by translate_sem in main.py).
+    async with glossary_lock:
+        glossary_snapshot = dict(glossary)
+
+    translations:     list[dict]      = []
+    glossary_updates: dict[str, str]  = {}
+    page_tokens:      dict[str, int]  = {"input": 0, "output": 0, "think": 0}
+    page_succeeded = False
+
+    for attempt in range(1, _MAX_PAGE_RETRIES + 2):   # +2 → initial + N retries
+        try:
+            translations, glossary_updates, page_tokens = await _translate_page(
+                translatable, glossary_snapshot, user_api_key=user_api_key
+            )
+            page_succeeded = True
+            break
+        except Exception as exc:
+            if attempt <= _MAX_PAGE_RETRIES:
+                wait = attempt * 5.0
+                log.warning(
+                    "[translator] Page %s failed (attempt %d/%d): %s — retry in %.0f s",
+                    page_path.name, attempt, _MAX_PAGE_RETRIES + 1, exc, wait,
+                )
+                await asyncio.sleep(wait)
+            else:
+                log.error(
+                    "[translator] Page %s failed after %d attempts: %s — skipping.",
+                    page_path.name, _MAX_PAGE_RETRIES + 1, exc,
+                )
+
+    if page_succeeded:
+        id_to_hebrew = {t["id"]: t["hebrew_text"] for t in translations}
+        for region in page_data["regions"]:
+            if region["id"] in id_to_hebrew:
+                region["hebrew_text"] = id_to_hebrew[region["id"]]
+        json_path.write_text(
+            json.dumps(page_data, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
+        if glossary_updates:
+            async with glossary_lock:
+                glossary.update(glossary_updates)
+                _save_glossary(job_dir, glossary)
+
+        log.info(
+            "[translator] %s — translated %d region(s), %d new glossary term(s).",
+            page_path.name, len(translations), len(glossary_updates),
+        )
+
+    return page_tokens
+
+
+# ---------------------------------------------------------------------------
 # Per-page Gemini call
 # ---------------------------------------------------------------------------
 
@@ -469,23 +496,21 @@ def _get_translatable(regions: list[dict]) -> list[dict]:
     ]
 
 
-_MAX_RETRY_ATTEMPTS  = 4   # extra per-region retry attempts (blank/null hebrew_text)
+_MAX_RETRY_ATTEMPTS  = 5   # extra per-region retry attempts (blank/null hebrew_text)
 _MAX_PAGE_RETRIES    = 3   # retries when the ENTIRE page call fails (network/API error)
 
 
 async def _translate_page(
     regions:      list[dict],
     glossary:     dict[str, str],
-    genders:      dict[str, str],
     user_api_key: str | None = None,
-) -> tuple[list[dict], dict[str, str], dict[str, str], dict[str, int]]:
+) -> tuple[list[dict], dict[str, str], dict[str, int]]:
     """
     Send one page's regions to Gemini.
-    Returns (translations, glossary_updates, gender_updates, token_counts).
+    Returns (translations, glossary_updates, token_counts).
 
     The user message contains:
     • the current glossary (consistent name translations)
-    • the current character_genders map (correct gendered forms)
     • a JSON array of {id, source_text, type} objects to translate
 
     After the first response, any region whose hebrew_text is missing or empty
@@ -518,15 +543,12 @@ async def _translate_page(
         }
 
     async def _call_gemini(
-        batch: list[dict], gloss: dict, gens: dict
-    ) -> tuple[list[dict], dict[str, str], dict[str, str], dict[str, int]]:
+        batch: list[dict], gloss: dict
+    ) -> tuple[list[dict], dict[str, str], dict[str, int]]:
         glossary_block = json.dumps(gloss, ensure_ascii=False, indent=2) if gloss else "{}"
-        genders_block  = json.dumps(gens,  ensure_ascii=False, indent=2) if gens  else "{}"
         user_message = (
             f"Glossary (use these translations exactly):\n"
             f"{glossary_block}\n\n"
-            f"Character genders (use for correct Hebrew gendered forms):\n"
-            f"{genders_block}\n\n"
             f"Translate these {len(batch)} comic region(s) to Hebrew:\n"
             f"{json.dumps(batch, ensure_ascii=False, indent=2)}"
         )
@@ -537,10 +559,10 @@ async def _translate_page(
                 config=config,
             )
         )
-        translations, glossary_updates, gender_updates = _parse_response(
+        translations, glossary_updates = _parse_response(
             response.text, expected_ids={r["id"] for r in batch}
         )
-        return translations, glossary_updates, gender_updates, _extract_tokens(response)
+        return translations, glossary_updates, _extract_tokens(response)
 
     # ── Initial call ──────────────────────────────────────────────────────────
     payload = [
@@ -552,14 +574,13 @@ async def _translate_page(
         for r in regions
     ]
 
-    translations, glossary_updates, gender_updates, total_tokens = \
-        await _call_gemini(payload, glossary, genders)
+    translations, glossary_updates, total_tokens = \
+        await _call_gemini(payload, glossary)
 
     # ── Retry loop for missing / blank translations ───────────────────────────
     id_to_source    = {r["id"]: r for r in payload}
     accumulated     = {t["id"]: t for t in translations}
     merged_glossary = {**glossary, **glossary_updates}
-    merged_genders  = {**genders,  **gender_updates}
 
     for attempt in range(1, _MAX_RETRY_ATTEMPTS + 1):
         # Find IDs that are still missing or have empty text
@@ -576,20 +597,18 @@ async def _translate_page(
         )
 
         retry_batch = [id_to_source[rid] for rid in missing_ids]
-        retry_trans, retry_gloss, retry_gens, retry_tokens = \
-            await _call_gemini(retry_batch, merged_glossary, merged_genders)
+        retry_trans, retry_gloss, retry_tokens = \
+            await _call_gemini(retry_batch, merged_glossary)
 
         for t in retry_trans:
             accumulated[t["id"]] = t
         glossary_updates.update(retry_gloss)
-        gender_updates.update(retry_gens)
         merged_glossary.update(retry_gloss)
-        merged_genders.update(retry_gens)
         # Accumulate retry token usage too
         for k in total_tokens:
             total_tokens[k] += retry_tokens.get(k, 0)
 
-    return list(accumulated.values()), glossary_updates, gender_updates, total_tokens
+    return list(accumulated.values()), glossary_updates, total_tokens
 
 
 # ---------------------------------------------------------------------------
@@ -599,9 +618,9 @@ async def _translate_page(
 def _parse_response(
     raw: str,
     expected_ids: set[int] | None = None,
-) -> tuple[list[dict], dict[str, str], dict[str, str]]:
+) -> tuple[list[dict], dict[str, str]]:
     """
-    Parse Gemini's JSON response into (translations, glossary_updates, character_genders).
+    Parse Gemini's JSON response into (translations, glossary_updates).
 
     Even with response_mime_type="application/json" the model occasionally
     wraps output in markdown fences — we strip them defensively.
@@ -621,7 +640,7 @@ def _parse_response(
             "  First 500 chars: %s",
             raw[:500],
         )
-        return [], {}, {}
+        return [], {}
 
     # ── Validate translations ─────────────────────────────────────────────
     raw_translations = data.get("translations", [])
@@ -657,21 +676,12 @@ def _parse_response(
             if isinstance(k, str) and isinstance(v, str) and k.strip() and v.strip():
                 glossary_updates[k.strip()] = v.strip()
 
-    # ── Validate character_genders ────────────────────────────────────────
-    raw_genders = data.get("character_genders", {})
-    character_genders: dict[str, str] = {}
-    if isinstance(raw_genders, dict):
-        for name, gender in raw_genders.items():
-            if (isinstance(name, str) and isinstance(gender, str)
-                    and name.strip() and gender.strip() in ("male", "female")):
-                character_genders[name.strip()] = gender.strip()
-
     if expected_ids:
         missing = expected_ids - seen_ids
         if missing:
             log.warning("[translator] Response missing IDs: %s", sorted(missing))
 
-    return translations, glossary_updates, character_genders
+    return translations, glossary_updates
 
 
 def _strip_markdown(text: str) -> str:

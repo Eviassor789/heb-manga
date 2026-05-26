@@ -32,6 +32,8 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import json as _json
+
 import cv2
 import numpy as np
 from PIL import Image
@@ -144,6 +146,40 @@ async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     return pages
 
 
+# ---------------------------------------------------------------------------
+# Public per-page entrypoint (used by the parallel pipeline in main.py)
+# ---------------------------------------------------------------------------
+
+async def inpaint_one_page(page_path: Path, job_dir: Path) -> float:
+    """
+    Inpaint a single page.  Writes cleaned/<page>.png.
+    Returns Modal GPU seconds consumed (0.0 for local processing).
+    """
+    detection_dir = job_dir / "detection"
+    cleaned_dir   = job_dir / "cleaned"
+    mask_path     = detection_dir / f"{page_path.stem}_mask.png"
+    out_path      = cleaned_dir   / page_path.name
+    loop          = asyncio.get_running_loop()
+    modal_seconds = 0.0
+
+    try:
+        if _USE_MODAL:
+            t0 = time.perf_counter()
+            await _inpaint_page_modal(page_path, mask_path, out_path)
+            modal_seconds = time.perf_counter() - t0
+        else:
+            await loop.run_in_executor(_executor, _inpaint_page, page_path, mask_path, out_path)
+    except Exception as exc:
+        import logging as _log
+        _log.getLogger(__name__).error(
+            "[inpainter] Page %s failed (%s) — copying original as fallback",
+            page_path.name, exc,
+        )
+        await loop.run_in_executor(None, shutil.copy2, page_path, out_path)
+
+    return modal_seconds
+
+
 _modal_inpaint_fn = None   # cached after first lookup
 
 
@@ -190,11 +226,31 @@ def _inpaint_page(page_path: Path, mask_path: Path, out_path: Path) -> None:
     mask_pil = Image.open(mask_path).convert("L")
     mask_np  = np.array(mask_pil, dtype=np.uint8)
 
+    # ── Refine mask: zero-out regions where OCR found no text ────────────────
+    # If a speech bubble was detected but OCR couldn't read it, erasing it
+    # would leave a blank white bubble with no translation.  Keep the original
+    # artwork pixels in those regions so the source text stays visible instead.
+    json_path = page_path.parent.parent / "detection" / f"{page_path.stem}.json"
+    if json_path.exists():
+        try:
+            page_data = _json.loads(json_path.read_text(encoding="utf-8"))
+            for region in page_data.get("regions", []):
+                if not region.get("source_text"):
+                    bbox = region.get("bbox", [])
+                    if len(bbox) == 4:
+                        x1, y1, x2, y2 = (int(v) for v in bbox)
+                        mask_np[y1:y2, x1:x2] = 0
+        except Exception:
+            pass  # if JSON is unreadable, fall back to original mask
+
     # ── Fast-path: empty mask ────────────────────────────────────────────────
     if mask_np.max() == 0:
         # No active pixels → nothing to inpaint → copy original unchanged
         shutil.copy2(page_path, out_path)
         return
+
+    # Rebuild PIL mask from the (possibly refined) numpy array
+    mask_pil = Image.fromarray(mask_np)
 
     # ── Choose backend ───────────────────────────────────────────────────────
     lama = _get_lama()
