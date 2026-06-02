@@ -34,15 +34,15 @@ export default function MangaCard({
       </div>
 
       {/* Info — fixed height so all cards are the same regardless of title length */}
-      <div className="p-3 flex flex-col" style={{ minHeight: '5.25rem' }}>
+      <div className="p-2 sm:p-3 flex flex-col" style={{ minHeight: '4.5rem' }}>
         {/* Title always reserves 2-line height */}
         <p
-          className="text-sm font-semibold text-zinc-100 line-clamp-2 leading-snug group-hover:text-pink-soft transition-colors"
-          style={{ minHeight: '2.625rem' }}
+          className="text-xs sm:text-sm font-semibold text-zinc-100 line-clamp-2 leading-snug group-hover:text-pink-soft transition-colors"
+          style={{ minHeight: '2.25rem' }}
         >
           {title}
         </p>
-        <p className="text-xs text-zinc-500 mt-1 truncate group-hover:text-pink-soft transition-colors">
+        <p className="text-[10px] sm:text-xs text-zinc-500 mt-0.5 truncate group-hover:text-pink-soft transition-colors">
           {subtitle ?? ' ' /* non-breaking space keeps the row height */}
         </p>
       </div>

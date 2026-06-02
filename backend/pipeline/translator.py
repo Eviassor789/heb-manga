@@ -34,11 +34,28 @@ import logging
 import os
 import re
 from pathlib import Path
+from typing import TypedDict
 
 from core.job_manager import EmitFn
 from core.rate_limiter import call_with_backoff
 
 log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Response schema — used for Gemini constrained-decoding (response_schema=)
+# ---------------------------------------------------------------------------
+
+class _Translation(TypedDict):
+    id: int
+    hebrew_text: str
+
+
+class _GeminiResponseRequired(TypedDict):
+    translations: list[_Translation]
+
+
+class _GeminiResponse(_GeminiResponseRequired, total=False):
+    glossary_updates: dict[str, str]
 
 # ---------------------------------------------------------------------------
 # Gemini config
@@ -147,6 +164,10 @@ Output requirements (strictly enforced)
   If the source is illegible or ambiguous, transliterate it phonetically
   rather than returning an empty value.
 • Every proper noun / term you encounter must appear in "glossary_updates".
+• When quoting a word or phrase INSIDE Hebrew text, use the Hebrew
+  geresh-pair ״ (U+05F4) — NOT ASCII double-quotes — because a bare "
+  inside a JSON string value breaks the parser.
+  ✓  הוא אמר ״עצור״     ✗  הוא אמר "עצור"
 
 Output format
 ─────────────
@@ -313,7 +334,7 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
                     break
                 except Exception as exc:
                     if page_attempt <= _MAX_PAGE_RETRIES:
-                        wait = page_attempt * 5.0
+                        wait = min(10.0 * (2 ** (page_attempt - 1)), 120.0)
                         log.warning(
                             "[translator] Page %s failed (attempt %d/%d): %s — retry in %.0f s",
                             page_path.name, page_attempt, _MAX_PAGE_RETRIES + 1, exc, wait,
@@ -429,6 +450,16 @@ async def translate_one_page(
     if not translatable:
         return {"input": 0, "output": 0, "think": 0}
 
+    # Skip pages that are already fully translated (e.g. when resuming after
+    # a partial failure — only re-translate pages with missing hebrew_text).
+    already_done = all(
+        (r.get("hebrew_text") or "").strip()
+        for r in translatable
+    )
+    if already_done:
+        log.debug("[translator] %s — already translated, skipping.", page_path.name)
+        return {"input": 0, "output": 0, "think": 0}
+
     # Snapshot the glossary under lock so we capture every term added by
     # pages that completed before us (serialised by translate_sem in main.py).
     async with glossary_lock:
@@ -448,7 +479,7 @@ async def translate_one_page(
             break
         except Exception as exc:
             if attempt <= _MAX_PAGE_RETRIES:
-                wait = attempt * 5.0
+                wait = min(10.0 * (2 ** (attempt - 1)), 120.0)
                 log.warning(
                     "[translator] Page %s failed (attempt %d/%d): %s — retry in %.0f s",
                     page_path.name, attempt, _MAX_PAGE_RETRIES + 1, exc, wait,
@@ -497,7 +528,8 @@ def _get_translatable(regions: list[dict]) -> list[dict]:
 
 
 _MAX_RETRY_ATTEMPTS  = 5   # extra per-region retry attempts (blank/null hebrew_text)
-_MAX_PAGE_RETRIES    = 3   # retries when the ENTIRE page call fails (network/API error)
+_MAX_PAGE_RETRIES    = 5   # retries when the ENTIRE page call fails (network/API error)
+                           # waits: 10 s, 20 s, 40 s, 80 s, 120 s (exponential, capped)
 
 
 async def _translate_page(
@@ -529,6 +561,12 @@ async def _translate_page(
         system_instruction=_SYSTEM_INSTRUCTION,
         temperature=_TEMPERATURE,
         response_mime_type="application/json",
+        # response_schema: TypedDict-based constrained decoding emits
+        # additionalProperties:false which is only valid on Vertex AI /
+        # Enterprise, not on the Developer API.  The combination of
+        # response_mime_type + the system-prompt no-ASCII-quote rule +
+        # _repair_unescaped_quotes() handles the blank-bubble problem
+        # without needing tokenizer-level schema enforcement.
     )
 
     def _extract_tokens(response) -> dict[str, int]:
@@ -586,7 +624,7 @@ async def _translate_page(
         # Find IDs that are still missing or have empty text
         missing_ids = [
             rid for rid in id_to_source
-            if rid not in accumulated or not accumulated[rid]["hebrew_text"].strip()
+            if rid not in accumulated or not (accumulated[rid].get("hebrew_text") or "").strip()
         ]
         if not missing_ids:
             break
@@ -615,6 +653,71 @@ async def _translate_page(
 # Response parsing
 # ---------------------------------------------------------------------------
 
+# Matches a JSON key→string-value line, e.g.:  "hebrew_text": "some text",
+# Group 1 = everything up-to-and-including the opening quote of the value
+# Group 2 = the value content (may contain unescaped inner quotes)
+# Group 3 = the closing quote plus optional trailing comma / whitespace
+_STRING_VALUE_RE = re.compile(r'^(\s*"[^"\\]+"\s*:\s*")(.+)("(?:,\s*)?)$')
+
+
+def _fix_inner_quotes(s: str) -> str:
+    """
+    Scan a JSON string *value* (already stripped of its surrounding quotes)
+    and replace every unescaped ASCII double-quote with the Hebrew
+    geresh-pair ״ (U+05F4), which is visually identical but JSON-safe.
+
+    Escaped sequences (\\", \\\\, etc.) are left untouched.
+    """
+    out: list[str] = []
+    i = 0
+    while i < len(s):
+        ch = s[i]
+        if ch == "\\" and i + 1 < len(s):
+            # Escaped sequence — copy both chars verbatim
+            out.append(ch)
+            i += 1
+            out.append(s[i])
+        elif ch == '"':
+            out.append("״")   # U+05F4 HEBREW PUNCTUATION GERSHAYIM
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _repair_unescaped_quotes(text: str) -> str | None:
+    """
+    Attempt to salvage a Gemini JSON response that contains unescaped ASCII
+    double-quotes inside Hebrew string values (e.g. "הוא אמר "שלום" לה").
+
+    Strategy — line-by-line scan:
+      • Find lines that look like  "key": "value[,]
+      • If the extracted value portion contains any bare `"`, replace them
+        with ״ (U+05F4) — a safe Hebrew punctuation character.
+      • Leave every other line untouched.
+
+    Returns the repaired text if at least one substitution was made,
+    or None when nothing could be fixed (so the caller can decide whether
+    to log an error).
+    """
+    lines   = text.split("\n")
+    repaired: list[str] = []
+    changed = False
+
+    for line in lines:
+        m = _STRING_VALUE_RE.match(line)
+        if m:
+            prefix, value, suffix = m.group(1), m.group(2), m.group(3)
+            if '"' in value:                         # has unescaped inner quotes
+                fixed = _fix_inner_quotes(value)
+                if fixed != value:
+                    line = prefix + fixed + suffix
+                    changed = True
+        repaired.append(line)
+
+    return "\n".join(repaired) if changed else None
+
+
 def _parse_response(
     raw: str,
     expected_ids: set[int] | None = None,
@@ -635,12 +738,26 @@ def _parse_response(
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
-        log.error(
-            "[translator] Could not parse Gemini JSON response.\n"
-            "  First 500 chars: %s",
-            raw[:500],
-        )
-        return [], {}
+        # First try: repair unescaped inner quotes (e.g. "הוא אמר "שלום"")
+        repaired = _repair_unescaped_quotes(text)
+        if repaired:
+            try:
+                data = json.loads(repaired)
+                log.info("[translator] JSON repaired — replaced unescaped inner quotes with ״")
+            except json.JSONDecodeError:
+                log.error(
+                    "[translator] Could not parse Gemini JSON response even after repair.\n"
+                    "  First 500 chars: %s",
+                    raw[:500],
+                )
+                return [], {}
+        else:
+            log.error(
+                "[translator] Could not parse Gemini JSON response.\n"
+                "  First 500 chars: %s",
+                raw[:500],
+            )
+            return [], {}
 
     # ── Validate translations ─────────────────────────────────────────────
     raw_translations = data.get("translations", [])

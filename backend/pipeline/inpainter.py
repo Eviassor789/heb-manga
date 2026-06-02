@@ -95,26 +95,34 @@ def _get_lama():
 # Public async entrypoint
 # ---------------------------------------------------------------------------
 
-async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
+async def inpaint(
+    job_dir: Path,
+    pages: list[Path],
+    emit: EmitFn,
+    modal_token_id:     str | None = None,
+    modal_token_secret: str | None = None,
+) -> list[Path]:
     """
     Erase text regions from every page using the masks from Step 1.
 
     Writes cleaned images to <job_dir>/cleaned/.
-    If USE_MODAL=true, each page is sent to a Modal T4 GPU instead of running locally.
+    Uses Modal GPU when USE_MODAL=true (server-level) or when per-job BYOK
+    credentials are supplied.  Falls back to local CPU/LaMa otherwise.
     Returns the same pages list unchanged (pipeline chaining convention).
     """
     await emit({"stage": "inpaint", "status": "running"})
 
     detection_dir = job_dir / "detection"
     cleaned_dir   = job_dir / "cleaned"
-    loop  = asyncio.get_running_loop()
-    total = len(pages)
+    loop      = asyncio.get_running_loop()
+    total     = len(pages)
     modal_seconds = 0.0
+    use_modal = _USE_MODAL or bool(modal_token_id and modal_token_secret)
 
     # Pre-warm LaMa in the executor so any load errors surface once, cleanly,
     # before we start processing pages. If LaMa fails, _lama_ok=False and all
     # pages will use the OpenCV fallback without re-attempting the download.
-    if not _USE_MODAL:
+    if not use_modal:
         await loop.run_in_executor(_executor, _get_lama)
 
     for i, page_path in enumerate(pages, start=1):
@@ -122,9 +130,9 @@ async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
         out_path  = cleaned_dir   / page_path.name
 
         try:
-            if _USE_MODAL:
+            if use_modal:
                 t0 = time.perf_counter()
-                await _inpaint_page_modal(page_path, mask_path, out_path)
+                await _inpaint_page_modal(page_path, mask_path, out_path, modal_token_id, modal_token_secret)
                 modal_seconds += time.perf_counter() - t0
             else:
                 await loop.run_in_executor(_executor, _inpaint_page, page_path, mask_path, out_path)
@@ -150,7 +158,12 @@ async def inpaint(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
 # Public per-page entrypoint (used by the parallel pipeline in main.py)
 # ---------------------------------------------------------------------------
 
-async def inpaint_one_page(page_path: Path, job_dir: Path) -> float:
+async def inpaint_one_page(
+    page_path: Path,
+    job_dir: Path,
+    modal_token_id:     str | None = None,
+    modal_token_secret: str | None = None,
+) -> float:
     """
     Inpaint a single page.  Writes cleaned/<page>.png.
     Returns Modal GPU seconds consumed (0.0 for local processing).
@@ -161,11 +174,12 @@ async def inpaint_one_page(page_path: Path, job_dir: Path) -> float:
     out_path      = cleaned_dir   / page_path.name
     loop          = asyncio.get_running_loop()
     modal_seconds = 0.0
+    use_modal     = _USE_MODAL or bool(modal_token_id and modal_token_secret)
 
     try:
-        if _USE_MODAL:
+        if use_modal:
             t0 = time.perf_counter()
-            await _inpaint_page_modal(page_path, mask_path, out_path)
+            await _inpaint_page_modal(page_path, mask_path, out_path, modal_token_id, modal_token_secret)
             modal_seconds = time.perf_counter() - t0
         else:
             await loop.run_in_executor(_executor, _inpaint_page, page_path, mask_path, out_path)
@@ -180,11 +194,43 @@ async def inpaint_one_page(page_path: Path, job_dir: Path) -> float:
     return modal_seconds
 
 
-_modal_inpaint_fn = None   # cached after first lookup
+_modal_inpaint_fn = None   # cached for server-level Modal (USE_MODAL=true)
+# Lazily created so it binds to the correct running event loop (not module-import time).
+_modal_env_lock: asyncio.Lock | None = None
 
 
-async def _inpaint_page_modal(page_path: Path, mask_path: Path, out_path: Path) -> None:
-    """Send one page + mask to the server's Modal GPU deployment for LaMa inpainting."""
+def _get_modal_env_lock() -> asyncio.Lock:
+    """Return the per-module asyncio.Lock, creating it on first use."""
+    global _modal_env_lock
+    if _modal_env_lock is None:
+        _modal_env_lock = asyncio.Lock()
+    return _modal_env_lock
+
+
+# Phrases the Modal SDK uses when token credentials are rejected.
+_MODAL_AUTH_PHRASES = (
+    "token id is malformed",
+    "token secret is malformed",
+    "invalid token",
+    "authentication failed",
+    "unauthorized",
+    "credentials",
+)
+
+
+def _is_modal_auth_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(phrase in msg for phrase in _MODAL_AUTH_PHRASES)
+
+
+async def _inpaint_page_modal(
+    page_path: Path,
+    mask_path: Path,
+    out_path: Path,
+    token_id:  str | None = None,
+    token_secret: str | None = None,
+) -> None:
+    """Send one page + mask to a Modal GPU deployment for LaMa inpainting."""
     import base64, modal
     global _modal_inpaint_fn
 
@@ -192,12 +238,38 @@ async def _inpaint_page_modal(page_path: Path, mask_path: Path, out_path: Path) 
         shutil.copy2(page_path, out_path)
         return
 
-    if _modal_inpaint_fn is None:
-        _modal_inpaint_fn = modal.Function.from_name("hebrew-manga-translator", "inpaint_page")
+    img_bytes = page_path.read_bytes()
+    mask_b64  = base64.b64encode(mask_path.read_bytes()).decode()
 
-    img_bytes    = page_path.read_bytes()
-    mask_b64     = base64.b64encode(mask_path.read_bytes()).decode()
-    result_bytes = await asyncio.to_thread(_modal_inpaint_fn.remote, img_bytes, mask_b64)
+    try:
+        if token_id and token_secret:
+            # Per-job BYOK: inject credentials temporarily under a lock.
+            async with _get_modal_env_lock():
+                old_id  = _os.environ.get("MODAL_TOKEN_ID")
+                old_sec = _os.environ.get("MODAL_TOKEN_SECRET")
+                try:
+                    _os.environ["MODAL_TOKEN_ID"]     = token_id
+                    _os.environ["MODAL_TOKEN_SECRET"] = token_secret
+                    fn = modal.Function.from_name("hebrew-manga-translator", "inpaint_page")
+                    result_bytes = await asyncio.to_thread(fn.remote, img_bytes, mask_b64)
+                finally:
+                    if old_id  is not None: _os.environ["MODAL_TOKEN_ID"]     = old_id
+                    elif "MODAL_TOKEN_ID"     in _os.environ: del _os.environ["MODAL_TOKEN_ID"]
+                    if old_sec is not None: _os.environ["MODAL_TOKEN_SECRET"] = old_sec
+                    elif "MODAL_TOKEN_SECRET" in _os.environ: del _os.environ["MODAL_TOKEN_SECRET"]
+        else:
+            # Server-level Modal (USE_MODAL=true in .env) — cache the function handle.
+            if _modal_inpaint_fn is None:
+                _modal_inpaint_fn = modal.Function.from_name("hebrew-manga-translator", "inpaint_page")
+            result_bytes = await asyncio.to_thread(_modal_inpaint_fn.remote, img_bytes, mask_b64)
+    except Exception as exc:
+        if _is_modal_auth_error(exc):
+            raise RuntimeError(
+                "Modal authentication failed — your Token ID or Token Secret is invalid. "
+                "Go to Settings and re-enter your Modal tokens."
+            ) from exc
+        raise
+
     out_path.write_bytes(result_bytes)
 
 

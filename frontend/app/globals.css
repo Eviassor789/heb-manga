@@ -69,7 +69,7 @@
     background: var(--accent);
     @apply text-white font-semibold px-6 py-3 rounded-xl
            transition-all duration-150 disabled:opacity-40
-           disabled:cursor-not-allowed focus:outline-none
+           disabled:cursor-not-allowed disabled:pointer-events-none focus:outline-none
            focus:ring-2 focus:ring-offset-2;
     --tw-ring-color: var(--accent);
     --tw-ring-offset-color: #09090f;
@@ -140,3 +140,15 @@
   to   { opacity: 1; transform: translateY(0);    }
 }
 .animate-slide-in { animation: slideIn 0.45s ease both; }
+
+/* ── Mobile / touch improvements ──────────────────────────────────────── */
+
+/* Prevent double-tap zoom on buttons and links */
+button, a {
+  touch-action: manipulation;
+}
+
+/* Ensure minimum tap target height on interactive elements */
+button, .btn-primary, .btn-ghost {
+  min-height: 2.5rem;
+}

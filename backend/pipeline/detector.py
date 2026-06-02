@@ -103,12 +103,19 @@ def _get_detector():
 # Public async entrypoint
 # ---------------------------------------------------------------------------
 
-async def detect(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
+async def detect(
+    job_dir: Path,
+    pages: list[Path],
+    emit: EmitFn,
+    modal_token_id: str | None = None,
+    modal_token_secret: str | None = None,
+) -> list[Path]:
     """
     Detect text regions across all pages.
 
     Writes per-page JSON + mask PNGs into <job_dir>/detection/.
-    If USE_MODAL=true, each page is sent to a Modal T4 GPU instead of running locally.
+    Uses Modal GPU when USE_MODAL=true (server-level) or when per-job BYOK
+    credentials are supplied.  Falls back to local CPU otherwise.
     Returns the same pages list unchanged (pipeline chaining convention).
     """
     await emit({"stage": "detect", "status": "running"})
@@ -117,11 +124,12 @@ async def detect(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
     loop  = asyncio.get_running_loop()
     total = len(pages)
     modal_seconds = 0.0
+    use_modal = _USE_MODAL or bool(modal_token_id and modal_token_secret)
 
     for i, page_path in enumerate(pages, start=1):
-        if _USE_MODAL:
+        if use_modal:
             t0 = time.perf_counter()
-            await _detect_page_modal(page_path, detection_dir)
+            await _detect_page_modal(page_path, detection_dir, modal_token_id, modal_token_secret)
             modal_seconds += time.perf_counter() - t0
         else:
             await loop.run_in_executor(_executor, _detect_page, page_path, detection_dir)
@@ -138,32 +146,94 @@ async def detect(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
 # Public per-page entrypoint (used by the parallel pipeline in main.py)
 # ---------------------------------------------------------------------------
 
-async def detect_one_page(page_path: Path, detection_dir: Path) -> None:
+async def detect_one_page(
+    page_path: Path,
+    detection_dir: Path,
+    modal_token_id:     str | None = None,
+    modal_token_secret: str | None = None,
+) -> None:
     """
     Run text detection on a single page.  Writes detection JSON + mask PNG.
     Safe to call concurrently — the single-thread executor serialises CPU work
     while the asyncio event loop can overlap async I/O from other stages.
     """
     loop = asyncio.get_running_loop()
-    if _USE_MODAL:
-        await _detect_page_modal(page_path, detection_dir)
+    if _USE_MODAL or (modal_token_id and modal_token_secret):
+        await _detect_page_modal(page_path, detection_dir, modal_token_id, modal_token_secret)
     else:
         await loop.run_in_executor(_executor, _detect_page, page_path, detection_dir)
 
 
-_modal_detect_fn = None   # cached after first lookup
+_modal_detect_fn = None   # cached for server-level Modal (USE_MODAL=true)
+# Lazily created so it binds to the correct running event loop (not module-import time).
+_modal_env_lock: asyncio.Lock | None = None
 
 
-async def _detect_page_modal(page_path: Path, detection_dir: Path) -> None:
-    """Send one page to the server's Modal GPU deployment and write results to detection/."""
+def _get_modal_env_lock() -> asyncio.Lock:
+    """Return the per-module asyncio.Lock, creating it on first use."""
+    global _modal_env_lock
+    if _modal_env_lock is None:
+        _modal_env_lock = asyncio.Lock()
+    return _modal_env_lock
+
+
+# Phrases the Modal SDK uses when token credentials are rejected.
+_MODAL_AUTH_PHRASES = (
+    "token id is malformed",
+    "token secret is malformed",
+    "invalid token",
+    "authentication failed",
+    "unauthorized",
+    "credentials",
+)
+
+
+def _is_modal_auth_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return any(phrase in msg for phrase in _MODAL_AUTH_PHRASES)
+
+
+async def _detect_page_modal(
+    page_path: Path,
+    detection_dir: Path,
+    token_id: str | None = None,
+    token_secret: str | None = None,
+) -> None:
+    """Send one page to a Modal GPU deployment and write results to detection/."""
     import base64, json as _json, modal
     global _modal_detect_fn
 
-    if _modal_detect_fn is None:
-        _modal_detect_fn = modal.Function.from_name("hebrew-manga-translator", "detect_page")
-
     img_bytes = page_path.read_bytes()
-    result    = await asyncio.to_thread(_modal_detect_fn.remote, img_bytes)
+
+    try:
+        if token_id and token_secret:
+            # Per-job BYOK credentials: inject temporarily under a lock so concurrent
+            # jobs with different tokens don't clobber each other's env vars.
+            async with _get_modal_env_lock():
+                old_id  = os.environ.get("MODAL_TOKEN_ID")
+                old_sec = os.environ.get("MODAL_TOKEN_SECRET")
+                try:
+                    os.environ["MODAL_TOKEN_ID"]     = token_id
+                    os.environ["MODAL_TOKEN_SECRET"] = token_secret
+                    fn = modal.Function.from_name("hebrew-manga-translator", "detect_page")
+                    result = await asyncio.to_thread(fn.remote, img_bytes)
+                finally:
+                    if old_id  is not None: os.environ["MODAL_TOKEN_ID"]     = old_id
+                    elif "MODAL_TOKEN_ID"     in os.environ: del os.environ["MODAL_TOKEN_ID"]
+                    if old_sec is not None: os.environ["MODAL_TOKEN_SECRET"] = old_sec
+                    elif "MODAL_TOKEN_SECRET" in os.environ: del os.environ["MODAL_TOKEN_SECRET"]
+        else:
+            # Server-level Modal (USE_MODAL=true in .env) — cache the function handle.
+            if _modal_detect_fn is None:
+                _modal_detect_fn = modal.Function.from_name("hebrew-manga-translator", "detect_page")
+            result = await asyncio.to_thread(_modal_detect_fn.remote, img_bytes)
+    except Exception as exc:
+        if _is_modal_auth_error(exc):
+            raise RuntimeError(
+                "Modal authentication failed — your Token ID or Token Secret is invalid. "
+                "Go to Settings and re-enter your Modal tokens."
+            ) from exc
+        raise
 
     # ── Write mask ────────────────────────────────────────────────────────────
     mask_path = detection_dir / f"{page_path.stem}_mask.png"

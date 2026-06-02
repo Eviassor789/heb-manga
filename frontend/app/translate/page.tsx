@@ -7,9 +7,9 @@
 
 import { useState, useRef, useCallback, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import Spinner from '@/components/Spinner'
-import ApiKeyModal from '@/components/ApiKeyModal'
-import { getApiHeaders, hasGeminiKey } from '@/lib/apiKeys'
+import { getApiHeaders, getGeminiKey, getModalTokens, hasGeminiKey, hasModalTokens } from '@/lib/apiKeys'
 
 // ── URL helpers ───────────────────────────────────────────────────────────────
 
@@ -33,7 +33,7 @@ interface ChapterPreview {
 
 async function fetchChapterPreview(uuid: string): Promise<ChapterPreview> {
   const res = await fetch(
-    `https://api.mangadex.org/chapter/${uuid}?includes[]=manga`,
+    `/api/mangadex/chapter/${uuid}?includes[]=manga`,
     { signal: AbortSignal.timeout(6000) },
   )
   if (!res.ok) throw new Error('Chapter not found')
@@ -73,9 +73,16 @@ export default function TranslatePage() {
   const [error,   setError]   = useState('')
   const fileRef = useRef<HTMLInputElement>(null)
 
-  // ── API key gate ──────────────────────────────────────────────────────────
-  const [keyGateOpen,   setKeyGateOpen]   = useState(false)
-  const [pendingAction, setPendingAction] = useState<'url' | 'file' | null>(null)
+  // ── Setup status (keys required before translating) ───────────────────────
+  const [hasGemini, setHasGemini] = useState(false)
+  const [hasModal,  setHasModal]  = useState(false)
+
+  useEffect(() => {
+    setHasGemini(hasGeminiKey())
+    setHasModal(hasModalTokens())
+  }, [])
+
+  const canTranslate = hasGemini && hasModal
 
   // ── URL preview ───────────────────────────────────────────────────────────
 
@@ -103,15 +110,23 @@ export default function TranslatePage() {
   // ── Submit ────────────────────────────────────────────────────────────────
 
   const submitUrl = async () => {
+    if (!canTranslate) { setError('Both a Gemini API key and Modal GPU tokens are required. Go to Settings.'); return }
     const raw = url.trim()
     if (!raw) { setError('Please enter a MangaDex chapter URL.'); return }
     if (!extractUUID(raw)) { setError("This doesn't look like a MangaDex chapter URL."); return }
     setLoading(true); setError('')
     try {
+      const { tokenId, tokenSecret } = getModalTokens()
       const res  = await fetch('/api/jobs/from-url', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...getApiHeaders() },
-        body: JSON.stringify({ url: raw, data_saver: dataSaver }),
+        body: JSON.stringify({
+          url:                raw,
+          data_saver:         dataSaver,
+          gemini_api_key:     getGeminiKey(),
+          modal_token_id:     tokenId     || undefined,
+          modal_token_secret: tokenSecret || undefined,
+        }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail ?? 'Failed to start job.')
@@ -124,11 +139,19 @@ export default function TranslatePage() {
   }
 
   const submitFile = async () => {
+    if (!canTranslate) { setError('Both a Gemini API key and Modal GPU tokens are required. Go to Settings.'); return }
     if (!file) { setError('Please select a file.'); return }
     setLoading(true); setError('')
     try {
+      const { tokenId, tokenSecret } = getModalTokens()
       const form = new FormData()
       form.append('file', file)
+      // Include API keys as form fields so they reach the backend reliably
+      // (HTTP headers can be stripped by some proxies on multipart/form-data requests).
+      const geminiKey = getGeminiKey()
+      if (geminiKey)   form.append('gemini_api_key',    geminiKey)
+      if (tokenId)     form.append('modal_token_id',    tokenId)
+      if (tokenSecret) form.append('modal_token_secret', tokenSecret)
       const res  = await fetch('/api/jobs', { method: 'POST', headers: getApiHeaders(), body: form })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail ?? 'Failed to start job.')
@@ -139,15 +162,6 @@ export default function TranslatePage() {
     }
   }
 
-  // Gate wrappers — check for Gemini key before submitting
-  const handleTranslateUrl = () => {
-    if (!hasGeminiKey()) { setPendingAction('url');  setKeyGateOpen(true); return }
-    submitUrl()
-  }
-  const handleTranslateFile = () => {
-    if (!hasGeminiKey()) { setPendingAction('file'); setKeyGateOpen(true); return }
-    submitFile()
-  }
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault(); setDragging(false)
@@ -173,7 +187,7 @@ export default function TranslatePage() {
         <p className="text-zinc-400">Paste a MangaDex link or upload a file — we handle the rest.</p>
       </div>
 
-      <div className="card w-full max-w-xl p-8">
+      <div className="card w-full max-w-xl p-5 sm:p-8">
 
         {/* Tabs */}
         <div className="flex gap-1 bg-zinc-800 p-1 rounded-xl mb-8">
@@ -195,7 +209,7 @@ export default function TranslatePage() {
                 <input className={`input pr-8 ${inputBorderClass}`} type="text"
                   placeholder="https://mangadex.org/chapter/…" value={url}
                   onChange={e => { setUrl(e.target.value); setError('') }}
-                  onKeyDown={e => e.key === 'Enter' && !loading && handleTranslateUrl()}
+                  onKeyDown={e => e.key === 'Enter' && !loading && canTranslate && submitUrl()}
                   spellCheck={false} />
                 {urlValid === true  && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-green-500 text-sm">✓</span>}
                 {urlValid === false && <span className="absolute right-3 top-1/2 -translate-y-1/2 text-red-500 text-sm">✗</span>}
@@ -279,27 +293,66 @@ export default function TranslatePage() {
           </div>
         )}
 
+        {/* Setup required banner — shown when either key is missing */}
+        {!canTranslate && (
+          <div
+            className="mt-5 rounded-xl px-4 py-3.5 flex flex-col gap-2.5"
+            style={{ background: 'rgba(234,179,8,0.06)', border: '1px solid rgba(234,179,8,0.2)' }}
+          >
+            <p className="text-xs font-semibold text-yellow-200/80 mb-0.5">
+              Setup required before translating:
+            </p>
+            {/* Gemini row */}
+            <div className="flex items-center gap-2.5">
+              <span
+                className="w-4 h-4 rounded-full flex items-center justify-center text-[9px] font-bold shrink-0"
+                style={{
+                  background: hasGemini ? 'rgba(74,222,128,0.15)' : 'rgba(239,68,68,0.15)',
+                  color:      hasGemini ? '#4ade80' : '#f87171',
+                  border:     `1px solid ${hasGemini ? 'rgba(74,222,128,0.4)' : 'rgba(239,68,68,0.4)'}`,
+                }}
+              >
+                {hasGemini ? '✓' : '✗'}
+              </span>
+              <span className="text-xs" style={{ color: hasGemini ? '#4ade80' : '#f87171' }}>
+                Gemini API key
+              </span>
+              <span className="text-[10px] text-zinc-600">— OCR &amp; translation</span>
+            </div>
+            {/* Modal row */}
+            <div className="flex items-center gap-2.5">
+              <span
+                className="w-4 h-4 rounded-full flex items-center justify-center text-[9px] font-bold shrink-0"
+                style={{
+                  background: hasModal ? 'rgba(74,222,128,0.15)' : 'rgba(239,68,68,0.15)',
+                  color:      hasModal ? '#4ade80' : '#f87171',
+                  border:     `1px solid ${hasModal ? 'rgba(74,222,128,0.4)' : 'rgba(239,68,68,0.4)'}`,
+                }}
+              >
+                {hasModal ? '✓' : '✗'}
+              </span>
+              <span className="text-xs" style={{ color: hasModal ? '#4ade80' : '#f87171' }}>
+                Modal GPU tokens
+              </span>
+              <span className="text-[10px] text-zinc-600">— text detection &amp; inpainting</span>
+            </div>
+            <Link
+              href="/settings"
+              className="mt-1 text-xs font-semibold self-start"
+              style={{ color: 'var(--accent)' }}
+            >
+              Go to Settings →
+            </Link>
+          </div>
+        )}
+
         <button
-          className="btn-primary w-full mt-6 flex items-center justify-center gap-2"
-          onClick={tab === 'url' ? handleTranslateUrl : handleTranslateFile}
-          disabled={loading || (tab === 'url' && urlValid === false)}>
+          className="btn-primary w-full mt-5 flex items-center justify-center gap-2"
+          onClick={tab === 'url' ? submitUrl : submitFile}
+          disabled={loading || !canTranslate || (tab === 'url' && urlValid === false)}>
           {loading ? <><Spinner size="sm" /> Starting…</> : <>Translate to Hebrew →</>}
         </button>
       </div>
-
-      {/* API key gate */}
-      <ApiKeyModal
-        open={keyGateOpen}
-        onClose={() => { setKeyGateOpen(false); setPendingAction(null) }}
-        onSave={() => {}}
-        onConfirm={() => {
-          setKeyGateOpen(false)
-          const action = pendingAction
-          setPendingAction(null)
-          if (action === 'url')  submitUrl()
-          if (action === 'file') submitFile()
-        }}
-      />
     </main>
   )
 }

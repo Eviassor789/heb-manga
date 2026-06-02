@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, useCallback } from 'react'
 import Link from 'next/link'
 import MangaCard from '@/components/MangaCard'
 import SkeletonCard from '@/components/SkeletonCard'
@@ -51,6 +51,8 @@ interface ReadingProgress {
   cover_url:   string | null
   chapter_id:  string
   chapter_num: string | null
+  page_num?:   number
+  page_count?: number | null
   last_read:   string
 }
 
@@ -68,7 +70,7 @@ interface HeroSlide {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-const MD_API      = 'https://api.mangadex.org'
+const MD_API      = '/api/mangadex'
 // 'erotica' removed — filters out hentai-adjacent content while keeping
 // mature titles like Berserk (rated 'suggestive' on MangaDex).
 const ALL_RATINGS = ['safe', 'suggestive']
@@ -245,8 +247,8 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
             </Link>
             <Link
               href={slide.href}
-              className="px-5 py-2.5 text-sm font-medium rounded-xl transition-all duration-150 border border-pink-soft/40 hover:border-pink-soft"
-              style={{ color: 'var(--pink-soft)' }}
+              className="px-5 py-2.5 text-sm font-medium rounded-xl transition-all duration-150 hover:[box-shadow:0_0_16px_rgba(228,183,227,0.15)]"
+              style={{ color: 'var(--pink-soft)', border: '1px solid var(--pink-soft)' }}
             >
               Details
             </Link>
@@ -255,30 +257,50 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
 
       </div>
 
-      {/* Cover — absolutely pinned to the right edge, larger */}
+      {/* Cover — small thumbnail on mobile, large panel on desktop */}
       {slide.coverUrl && (
-        <div
-          className="hidden md:block absolute"
-          style={{
-            right:     '20%',
-            top:       '50%',
-            transform: 'translateY(-50%)',
-            width:     'clamp(190px, 20vw, 350px)',
-            zIndex:    1,
-          }}
-        >
+        <>
+          {/* Mobile: small thumbnail top-right corner */}
           {/* eslint-disable-next-line @next/next/no-img-element */}
           <img
-            key={slide.id + '-cover'}
+            key={slide.id + '-cover-sm'}
             src={slide.coverUrl}
             alt={slide.title}
-            className="w-full rounded-xl object-cover animate-fade-in"
+            className="md:hidden absolute animate-fade-in rounded-lg object-cover"
             style={{
+              top:       '16px',
+              right:     '16px',
+              width:     '72px',
               aspectRatio: '3/4',
-              boxShadow:   '0 24px 72px rgba(0,0,0,0.85), 0 0 0 1px var(--card-border-hover)',
+              zIndex:    1,
+              boxShadow: '0 8px 24px rgba(0,0,0,0.85)',
             }}
           />
-        </div>
+
+          {/* Desktop: large panel pinned to the right */}
+          <div
+            className="hidden md:block absolute"
+            style={{
+              right:     '20%',
+              top:       '50%',
+              transform: 'translateY(-50%)',
+              width:     'clamp(190px, 20vw, 350px)',
+              zIndex:    1,
+            }}
+          >
+            {/* eslint-disable-next-line @next/next/no-img-element */}
+            <img
+              key={slide.id + '-cover'}
+              src={slide.coverUrl}
+              alt={slide.title}
+              className="w-full rounded-xl object-cover animate-fade-in"
+              style={{
+                aspectRatio: '3/4',
+                boxShadow:   '0 24px 72px rgba(0,0,0,0.85), 0 0 0 1px var(--card-border-hover)',
+              }}
+            />
+          </div>
+        </>
       )}
 
       {/* Prev / Next arrows */}
@@ -286,7 +308,7 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
         <>
           <button
             aria-label="Previous"
-            className="absolute left-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-full flex items-center justify-center text-zinc-300 hover:text-white transition-all text-lg"
+            className="absolute left-3 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full flex items-center justify-center text-zinc-300 hover:text-white transition-all text-lg"
             style={{ background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.1)' }}
             onClick={() => setCurrent(c => (c - 1 + slides.length) % slides.length)}
           >
@@ -294,7 +316,7 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
           </button>
           <button
             aria-label="Next"
-            className="absolute right-3 top-1/2 -translate-y-1/2 w-9 h-9 rounded-full flex items-center justify-center text-zinc-300 hover:text-white transition-all text-lg"
+            className="absolute right-3 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full flex items-center justify-center text-zinc-300 hover:text-white transition-all text-lg"
             style={{ background: 'rgba(0,0,0,0.5)', border: '1px solid rgba(255,255,255,0.1)' }}
             onClick={() => setCurrent(c => (c + 1) % slides.length)}
           >
@@ -313,8 +335,9 @@ function HeroCarousel({ slides, loading }: { slides: HeroSlide[]; loading: boole
               onClick={() => setCurrent(i)}
               className="rounded-full transition-all duration-300"
               style={{
-                width:      i === current ? '22px' : '6px',
-                height:     '6px',
+                width:     i === current ? '22px' : '6px',
+                height:    '6px',
+                minHeight: '6px',   /* override global button min-height */
                 background: i === current ? 'var(--pink-soft)' : 'rgba(255,255,255,0.22)',
               }}
             />
@@ -347,12 +370,12 @@ function RowSection({
   return (
     <section className="mb-10">
       {/* Row header */}
-      <div className="flex items-center justify-between mb-4 px-4 sm:px-8 xl:px-32">
-        <h2 className="font-bold" style={{ fontSize: '23px', color: 'var(--pink-soft)' }}>{title}</h2>
+      <div className="flex items-center gap-2 mb-4 px-4 sm:px-8 xl:px-32 min-w-0">
+        <h2 className="font-bold text-sm sm:text-lg truncate flex-1" style={{ color: 'var(--pink-soft)' }}>{title}</h2>
         {href && hrefLabel && (
           <Link
             href={href}
-            className="text-xs text-zinc-500 hover:text-[var(--accent)] transition-colors"
+            className="text-xs text-zinc-500 hover:text-[var(--accent)] transition-colors shrink-0 whitespace-nowrap"
           >
             {hrefLabel}
           </Link>
@@ -381,7 +404,7 @@ function RowSection({
         >
           {loading
             ? Array.from({ length: 9 }).map((_, i) => (
-                <div key={i} className="w-36 sm:w-44 flex-shrink-0">
+                <div key={i} className="w-28 sm:w-44 flex-shrink-0">
                   <SkeletonCard />
                 </div>
               ))
@@ -475,14 +498,17 @@ export default function HomePage() {
 
     // MangaDex popular — skip fetch when cache is still fresh (10 min TTL)
     if (!cacheGet('home:md-popular', 10 * 60_000)) {
-      const mdUrl = new URL(`${MD_API}/manga`)
-      mdUrl.searchParams.set('limit', '24')
-      mdUrl.searchParams.set('includes[]', 'cover_art')
-      mdUrl.searchParams.set('availableTranslatedLanguage[]', 'en')
-      mdUrl.searchParams.set('order[followedCount]', 'desc')
-      ALL_RATINGS.forEach(r => mdUrl.searchParams.append('contentRating[]', r))
-      MD_EXCLUDED_TAGS.forEach(id => mdUrl.searchParams.append('excludedTags[]', id))
-      fetch(mdUrl.toString())
+      // Build query manually — URLSearchParams encodes [] to %5B%5D which
+      // some proxy layers don't round-trip correctly for MangaDex's API.
+      const mdQuery = [
+        'limit=24',
+        'includes[]=cover_art',
+        'availableTranslatedLanguage[]=en',
+        'order[followedCount]=desc',
+        ...ALL_RATINGS.map(r => `contentRating[]=${encodeURIComponent(r)}`),
+        ...MD_EXCLUDED_TAGS.map(id => `excludedTags[]=${encodeURIComponent(id)}`),
+      ].join('&')
+      fetch(`${MD_API}/manga?${mdQuery}`)
         .then(r => r.json())
         .then(d => {
           const popular = d.data ?? []
@@ -503,6 +529,36 @@ export default function HomePage() {
       .sort((a, b) => b.translated_at.localeCompare(a.translated_at))
       .slice(0, 20)
   , [libraryChapters])
+
+  // Remove a manga from the Continue Reading row (by manga_id)
+  const dismissProgress = useCallback((mangaId: string) => {
+    setContinueReading(prev => {
+      const updated = prev.filter(e => e.manga_id !== mangaId)
+      try { localStorage.setItem('hemanga-continue-reading', JSON.stringify(updated)) } catch {}
+      return updated
+    })
+  }, [])
+
+  // Resolve each Continue Reading entry:
+  //   • Not finished → show as-is
+  //   • Finished + next chapter exists in library → show next chapter ("Next: Ch. X")
+  //   • Finished + no next chapter → hide (user completed the series arc)
+  const resolvedContinue = useMemo(() =>
+    continueReading.flatMap(p => {
+      const isFinished = !!(p.page_num && p.page_count && p.page_num >= p.page_count)
+      if (!isFinished) {
+        return [{ ...p, displayChapterId: p.chapter_id, displayChapterNum: p.chapter_num, isNext: false }]
+      }
+      // Sort manga's library chapters by chapter number, find the one after current
+      const siblings = libraryChapters
+        .filter(ch => ch.manga_id === p.manga_id)
+        .sort((a, b) => parseFloat(a.chapter_num ?? '0') - parseFloat(b.chapter_num ?? '0'))
+      const idx  = siblings.findIndex(ch => ch.id === p.chapter_id)
+      const next = idx >= 0 ? siblings[idx + 1] : undefined
+      if (!next) return []   // finished the last translated chapter — hide the card
+      return [{ ...p, displayChapterId: next.id, displayChapterNum: next.chapter_num, isNext: true }]
+    })
+  , [continueReading, libraryChapters])
 
   // Carousel: always interleave ≤4 library slides with ≤4 MangaDex popular slides.
   // lib[0] → md[0] → lib[1] → md[1] … so both sources appear throughout, never
@@ -574,7 +630,7 @@ export default function HomePage() {
     const mdFetches = heroLib
       .filter(s => !/^[0-9A-HJKMNP-TV-Z]{26}$/i.test(s.manga_id) && !mdPopularIds.has(s.manga_id))
       .map(s =>
-        fetch(`https://api.mangadex.org/manga/${s.manga_id}`)
+        fetch(`/api/mangadex/manga/${s.manga_id}`)
           .then(r => r.json())
           .then(d => ({
             id: s.manga_id,
@@ -637,16 +693,63 @@ export default function HomePage() {
       <div className="pt-8">
 
         {/* 1. Continue Reading — most personal, highest re-engagement, always first */}
-        {continueReading.length > 0 && (
+        {resolvedContinue.length > 0 && (
           <RowSection title="Continue Reading">
-            {continueReading.map(p => (
-              <div key={p.manga_id} className="w-36 sm:w-44 flex-shrink-0">
+            {resolvedContinue.map(r => (
+              <div key={r.manga_id} className="w-28 sm:w-44 flex-shrink-0 relative group/card">
                 <MangaCard
-                  href={`/library/${p.chapter_id}`}
-                  title={p.manga_title}
-                  coverUrl={p.cover_url}
-                  subtitle={p.chapter_num ? `Ch. ${p.chapter_num}` : 'Resume'}
+                  href={`/library/${r.displayChapterId}`}
+                  title={r.manga_title}
+                  coverUrl={r.cover_url}
+                  subtitle={
+                    r.isNext
+                      ? r.displayChapterNum ? `Next: Ch. ${r.displayChapterNum}` : 'Next Chapter'
+                      : r.chapter_num
+                        ? r.page_num && r.page_count
+                          ? `Ch. ${r.chapter_num} · ${r.page_num}/${r.page_count}`
+                          : `Ch. ${r.chapter_num}`
+                        : r.page_num && r.page_count
+                          ? `${r.page_num}/${r.page_count}`
+                          : 'Resume'
+                  }
                 />
+                {/* Dismiss button — top-right */}
+                <button
+                  onClick={e => { e.stopPropagation(); e.preventDefault(); dismissProgress(r.manga_id) }}
+                  className="absolute top-1.5 right-1.5 z-10 w-5 h-5 rounded-full flex items-center justify-center transition-opacity opacity-50 sm:opacity-0 sm:group-hover/card:opacity-100 focus-visible:opacity-100"
+                  style={{
+                    background: 'rgba(9,9,15,0.88)',
+                    border:     '1px solid rgba(255,255,255,0.18)',
+                    color:      '#a1a1aa',
+                    fontSize:   '11px',
+                    minHeight:  'auto',
+                    lineHeight: 1,
+                  }}
+                  aria-label="Remove from Continue Reading"
+                  title="Remove"
+                >
+                  ✕
+                </button>
+
+                {/* Series info button — bottom-right, Netflix-style */}
+                <Link
+                  href={seriesHref(r.manga_id)}
+                  className="absolute bottom-2 right-2 z-10 w-[1.35rem] h-[1.35rem] rounded-full flex items-center justify-center transition-opacity opacity-0 sm:group-hover/card:opacity-100 focus-visible:opacity-100"
+                  style={{
+                    background: 'rgba(9,9,15,0.75)',
+                    border:     '1.5px solid rgba(255,255,255,0.55)',
+                    color:      'rgba(255,255,255,0.85)',
+                    backdropFilter: 'blur(4px)',
+                  }}
+                  aria-label="View series page"
+                  title="View series"
+                >
+                  <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
+                       stroke="currentColor" strokeWidth="3.5" strokeLinecap="round">
+                    <line x1="12" y1="10" x2="12" y2="18"/>
+                    <line x1="12" y1="6"  x2="12.01" y2="6"/>
+                  </svg>
+                </Link>
               </div>
             ))}
           </RowSection>
@@ -661,7 +764,7 @@ export default function HomePage() {
           empty={wcFeatured.length === 0}
         >
           {wcFeatured.map(m => (
-            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
+            <div key={m.id} className="w-28 sm:w-44 flex-shrink-0">
               <MangaCard
                 href={`/weebcentral/${m.id}`}
                 title={m.title}
@@ -680,7 +783,7 @@ export default function HomePage() {
           empty={mdPopular.length === 0}
         >
           {mdPopular.map(m => (
-            <div key={m.id} className="w-36 sm:w-44 flex-shrink-0">
+            <div key={m.id} className="w-28 sm:w-44 flex-shrink-0">
               <MangaCard
                 href={`/manga/${m.id}`}
                 title={getMDTitle(m)}
@@ -697,7 +800,7 @@ export default function HomePage() {
           empty={recentChapters.length === 0}
         >
           {recentChapters.map(ch => (
-            <div key={ch.id} className="w-36 sm:w-44 flex-shrink-0">
+            <div key={ch.id} className="w-28 sm:w-44 flex-shrink-0">
               <MangaCard
                 href={`/library/${ch.id}`}
                 title={ch.manga_title}
@@ -715,7 +818,7 @@ export default function HomePage() {
           empty={librarySeries.length === 0}
         >
           {/* "+" add card */}
-          <div className="w-36 sm:w-44 flex-shrink-0 self-stretch">
+          <div className="w-28 sm:w-44 flex-shrink-0 self-stretch">
             <Link href="/discover" className="group block h-full">
               <div
                 className="rounded-xl border-2 border-dashed flex flex-col items-center justify-center gap-2 text-zinc-600 group-hover:text-[var(--accent)] group-hover:bg-[var(--accent-subtle)] transition-all duration-200 h-full"
@@ -732,7 +835,7 @@ export default function HomePage() {
           {librarySeries.map(s => {
             const src = getSource(s.manga_id)
             return (
-              <div key={s.manga_id} className="w-36 sm:w-44 flex-shrink-0">
+              <div key={s.manga_id} className="w-28 sm:w-44 flex-shrink-0">
                 <MangaCard
                   href={seriesHref(s.manga_id)}
                   title={s.manga_title}

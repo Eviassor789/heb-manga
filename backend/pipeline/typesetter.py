@@ -215,7 +215,7 @@ async def typeset(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path]:
             src = page_path
 
         json_path = detection_dir / f"{page_path.stem}.json"
-        out_path  = output_dir    / page_path.name
+        out_path  = output_dir    / (page_path.stem + ".jpg")
 
         await loop.run_in_executor(
             _executor, _typeset_page, src, json_path, out_path
@@ -249,7 +249,7 @@ async def typeset_one_page(page_path: Path, job_dir: Path) -> None:
         src = page_path
 
     json_path = detection_dir / f"{page_path.stem}.json"
-    out_path  = output_dir    / page_path.name
+    out_path  = output_dir    / (page_path.stem + ".jpg")
 
     await loop.run_in_executor(_executor, _typeset_page, src, json_path, out_path)
 
@@ -300,7 +300,7 @@ def _typeset_page(src_path: Path, json_path: Path, out_path: Path) -> None:
             rendered_bboxes.append(bbox)
             _render_region(draw, hebrew, bbox, img.size)
 
-    img.save(str(out_path), format="PNG", optimize=False)
+    img.save(str(out_path), format="JPEG", quality=85, optimize=True, subsampling=2)
 
 
 # ---------------------------------------------------------------------------
@@ -523,8 +523,8 @@ def _assemble_pdf(output_dir: Path) -> None:
     correct because all stems are zero-padded to the same width.
     """
     page_paths = sorted(
-        p for p in output_dir.glob("*.png")
-        if p.stem.isdigit()
+        p for p in output_dir.iterdir()
+        if p.stem.isdigit() and p.suffix.lower() in (".jpg", ".jpeg", ".png")
     )
 
     if not page_paths:

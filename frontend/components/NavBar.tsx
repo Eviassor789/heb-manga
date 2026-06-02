@@ -3,13 +3,43 @@
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { usePathname, useRouter } from 'next/navigation'
-import ApiKeyModal from '@/components/ApiKeyModal'
-import { hasGeminiKey } from '@/lib/apiKeys'
+import { hasGeminiKey, hasModalTokens } from '@/lib/apiKeys'
+
+function HomeIcon({ className = '' }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+      <polyline points="9 22 9 12 15 12 15 22" />
+    </svg>
+  )
+}
+
+function CompassIcon({ className = '' }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="12" cy="12" r="10" />
+      <polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88" />
+    </svg>
+  )
+}
+
+function UploadIcon({ className = '' }: { className?: string }) {
+  return (
+    <svg className={className} viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
+      <polyline points="17 8 12 3 7 8" />
+      <line x1="12" y1="3" x2="12" y2="15" />
+    </svg>
+  )
+}
 
 const LINKS = [
-  { href: '/',          label: 'Home',     icon: '🏠' },
-  { href: '/discover',  label: 'Discover', icon: '🔍' },
-  { href: '/translate', label: 'Upload',   icon: '⬆'  },
+  { href: '/',          label: 'Home',     Icon: HomeIcon     },
+  { href: '/discover',  label: 'Discover', Icon: CompassIcon  },
+  { href: '/translate', label: 'Upload',   Icon: UploadIcon   },
 ]
 
 function SearchIcon({ className = '' }: { className?: string }) {
@@ -27,13 +57,19 @@ export default function NavBar() {
   const router   = useRouter()
 
   const [query,            setQuery]            = useState('')
-  const [modalOpen,        setModalOpen]        = useState(false)
   const [hasKey,           setHasKey]           = useState(false)
+  const [hasGpu,           setHasGpu]           = useState(false)
   const [mobileSearchOpen, setMobileSearchOpen] = useState(false)
 
   const mobileInputRef = useRef<HTMLInputElement>(null)
 
-  useEffect(() => { setHasKey(hasGeminiKey()) }, [])
+  // Re-read on every navigation AND whenever a key is saved/cleared on the same page
+  useEffect(() => { setHasKey(hasGeminiKey()); setHasGpu(hasModalTokens()) }, [pathname])
+  useEffect(() => {
+    const refresh = () => { setHasKey(hasGeminiKey()); setHasGpu(hasModalTokens()) }
+    window.addEventListener('hemanga-keys-changed', refresh)
+    return () => window.removeEventListener('hemanga-keys-changed', refresh)
+  }, [])
 
   // Auto-focus the mobile search input when it opens
   useEffect(() => {
@@ -43,7 +79,6 @@ export default function NavBar() {
   // Close mobile search when navigating away
   useEffect(() => { setMobileSearchOpen(false) }, [pathname])
 
-  const refreshKeyStatus = () => setHasKey(hasGeminiKey())
 
   // Full-screen reader: hide nav entirely
   if (pathname.startsWith('/library/')) return null
@@ -71,7 +106,7 @@ export default function NavBar() {
 
           {/* Nav links — truly centered via absolute positioning */}
           <div className="absolute left-1/2 -translate-x-1/2 flex items-center gap-0.5">
-            {LINKS.map(({ href, label, icon }) => {
+            {LINKS.map(({ href, label, Icon }) => {
               const active = href === '/' ? pathname === '/' : pathname.startsWith(href)
               return (
                 <Link
@@ -83,7 +118,7 @@ export default function NavBar() {
                       : 'text-zinc-500 hover:text-pink-soft'
                   }`}
                 >
-                  <span>{icon}</span>
+                  <Icon className="w-4 h-4 shrink-0" />
                   <span className="hidden sm:block">{label}</span>
                 </Link>
               )
@@ -123,22 +158,23 @@ export default function NavBar() {
               <SearchIcon className="w-4 h-4" />
             </button>
 
-            {/* API Key button */}
-            <button
-              onClick={() => setModalOpen(true)}
+            {/* Settings button — shows combined Gemini + GPU status */}
+            <Link
+              href="/settings"
               className="relative flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-medium transition-all"
               style={{ border: '1px solid var(--card-border)' }}
-              title={hasKey ? 'API key configured — click to update' : 'Set your Gemini API key'}
+              title="Settings — API keys & GPU"
             >
-              <span
-                className="w-1.5 h-1.5 rounded-full shrink-0"
-                style={{ background: hasKey ? '#4ade80' : '#f87171' }}
-              />
-              <span className="hidden sm:block" style={{ color: hasKey ? '#4ade80' : '#f87171' }}>
-                {hasKey ? 'Key set' : 'Add key'}
+              {/* Two stacked dots: top = Gemini, bottom = GPU */}
+              <span className="flex flex-col gap-0.5 shrink-0">
+                <span className="w-1.5 h-1.5 rounded-full"
+                      style={{ background: hasKey ? '#4ade80' : '#f87171' }} />
+                <span className="w-1.5 h-1.5 rounded-full"
+                      style={{ background: hasGpu ? '#4ade80' : '#f87171' }} />
               </span>
-              <span className="sm:hidden text-zinc-400">🔑</span>
-            </button>
+              <span className="hidden sm:block text-zinc-400">Settings</span>
+              <span className="sm:hidden text-zinc-400">⚙</span>
+            </Link>
           </div>
 
         </div>
@@ -165,11 +201,6 @@ export default function NavBar() {
         )}
       </nav>
 
-      <ApiKeyModal
-        open={modalOpen}
-        onClose={() => setModalOpen(false)}
-        onSave={refreshKeyStatus}
-      />
     </>
   )
 }

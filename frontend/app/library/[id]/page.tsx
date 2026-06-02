@@ -76,9 +76,13 @@ export default function ReaderPage() {
   const hideTimerRef    = useRef<ReturnType<typeof setTimeout> | null>(null)
   const barVisibleRef   = useRef(false)
   const settingsRef     = useRef(false)
+  // Saved page number read from localStorage on mount; consumed once after chapter loads.
+  const initialPageRef  = useRef(0)
   // Refs for the settings popover and the gear toggle button (click-outside detection).
   const settingsPanelRef = useRef<HTMLDivElement>(null)
   const gearButtonRef    = useRef<HTMLButtonElement>(null)
+  const touchStartXRef   = useRef<number>(0)
+  const touchStartYRef   = useRef<number>(0)
   // Set to true by changeZoom so the layout effect knows to snap scroll position.
   const hasZoomedRef    = useRef(false)
   // Mirrors currentPage as a ref so useLayoutEffect can read it without deps.
@@ -100,7 +104,7 @@ export default function ReaderPage() {
     return () => document.removeEventListener('mousedown', handleDown)
   }, [settingsOpen])
 
-  // ── Load preferences ──────────────────────────────────────────────────────
+  // ── Load preferences + saved page ────────────────────────────────────────
 
   useEffect(() => {
     const savedDir  = localStorage.getItem('reader-direction') as ReadDirection | null
@@ -108,7 +112,13 @@ export default function ReaderPage() {
 
     if (savedDir && ['ttb', 'ltr'].includes(savedDir)) setDirection(savedDir)
     if (!isNaN(savedZoom)) setZoom(Math.max(ZOOM_MIN, Math.min(ZOOM_MAX, savedZoom)))
-  }, [])
+
+    // Read saved page for this chapter — applied after chapter metadata loads.
+    if (id) {
+      const saved = parseInt(localStorage.getItem(`hemanga-page-${id}`) ?? '', 10)
+      if (saved > 1) initialPageRef.current = saved
+    }
+  }, [id])
 
   const changeDirection = useCallback((d: ReadDirection) => {
     setDirection(d)
@@ -174,12 +184,17 @@ export default function ReaderPage() {
   useEffect(() => {
     if (!chapter || !id) return
     try {
+      // Save per-chapter page number so the reader can resume at the right spot.
+      localStorage.setItem(`hemanga-page-${id}`, String(currentPage))
+
       const entry = {
         manga_id:    chapter.manga_id ?? id,
         manga_title: chapter.manga_title,
         cover_url:   chapter.cover_url ?? null,
         chapter_id:  id,
         chapter_num: chapter.chapter_num ?? null,
+        page_num:    currentPage,
+        page_count:  chapter.page_count ?? null,
         last_read:   new Date().toISOString(),
       }
       const raw      = localStorage.getItem('hemanga-continue-reading') ?? '[]'
@@ -191,6 +206,31 @@ export default function ReaderPage() {
       )
     } catch { /* localStorage unavailable — ignore */ }
   }, [currentPage, chapter, id])
+
+  // ── Restore saved page position after chapter metadata loads ─────────────
+  // initialPageRef is set from localStorage on mount; consumed here exactly once.
+  // direction is already set from localStorage (effect above runs before fetch completes).
+
+  useEffect(() => {
+    const target = initialPageRef.current
+    if (!target || !chapter?.page_count) return
+    initialPageRef.current = 0   // consume — don't restore again on re-renders
+
+    const clamped = Math.min(target, chapter.page_count)
+    if (clamped <= 1) return
+
+    setCurrentPage(clamped)
+
+    if (direction === 'ttb') {
+      // Images may still be loading so we wait a short moment before scrolling,
+      // giving the browser time to assign heights to the page divs.
+      setTimeout(() => {
+        const el = pageRefs.current[clamped - 1]
+        if (el) el.scrollIntoView({ behavior: 'instant', block: 'start' })
+      }, 120)
+    }
+    // LTR: setCurrentPage above is sufficient — the slide strip translates immediately.
+  }, [chapter, direction])
 
   // ── Intersection observer → track visible page (TTB only) ─────────────────
 
@@ -252,7 +292,7 @@ export default function ReaderPage() {
     if (!barVisibleRef.current) { barVisibleRef.current = true; setBarVisible(true) }
   }, [])
 
-  const scheduleHide = useCallback(() => {
+  const scheduleHide = useCallback((ms = 1500) => {
     if (hideTimerRef.current) return
     hideTimerRef.current = setTimeout(() => {
       hideTimerRef.current = null
@@ -260,19 +300,49 @@ export default function ReaderPage() {
       barVisibleRef.current = false
       setBarVisible(false)
       setHoverPage(null)
-    }, 600)
+    }, ms)
   }, [])
 
   useEffect(() => {
     let wasNear = false
+    // Local vars to track the touch start position for tap vs. scroll detection.
+    // Using local vars (not refs) is safe here because the closure is recreated
+    // whenever showBar/scheduleHide change (the useEffect deps).
+    let barTouchStartX = 0
+    let barTouchStartY = 0
+
     const onMove = (e: MouseEvent) => {
       const near = window.innerHeight - e.clientY < 120
       if (near && !wasNear) showBar()
       else if (!near && wasNear) scheduleHide()
       wasNear = near
     }
-    window.addEventListener('mousemove', onMove, { passive: true })
-    return () => window.removeEventListener('mousemove', onMove)
+
+    // Record position on touchstart — don't show bar yet.
+    // Showing on touchstart causes flashing on every scroll gesture.
+    const onTouchStart = (e: TouchEvent) => {
+      barTouchStartX = e.touches[0].clientX
+      barTouchStartY = e.touches[0].clientY
+    }
+
+    // Show bar only if the touch ended with minimal movement (i.e. a tap, not a scroll/swipe).
+    const onTouchEnd = (e: TouchEvent) => {
+      const dx = Math.abs(e.changedTouches[0].clientX - barTouchStartX)
+      const dy = Math.abs(e.changedTouches[0].clientY - barTouchStartY)
+      if (dx < 10 && dy < 10) {
+        showBar()
+        scheduleHide(3000)   // stay visible for 3 s on mobile tap
+      }
+    }
+
+    window.addEventListener('mousemove',  onMove,      { passive: true })
+    window.addEventListener('touchstart', onTouchStart, { passive: true })
+    window.addEventListener('touchend',   onTouchEnd,   { passive: true })
+    return () => {
+      window.removeEventListener('mousemove',  onMove)
+      window.removeEventListener('touchstart', onTouchStart)
+      window.removeEventListener('touchend',   onTouchEnd)
+    }
   }, [showBar, scheduleHide])
 
   // ── Segment bar hover ──────────────────────────────────────────────────────
@@ -315,7 +385,22 @@ export default function ReaderPage() {
   // ── Horizontal single-page viewer ─────────────────────────────────────────
 
   const renderHorizontal = () => (
-    <div className="relative w-full h-screen overflow-hidden bg-zinc-950">
+    <div
+      className="relative w-full h-screen overflow-hidden bg-zinc-950"
+      onTouchStart={e => {
+        touchStartXRef.current = e.touches[0].clientX
+        touchStartYRef.current = e.touches[0].clientY
+      }}
+      onTouchEnd={e => {
+        const dx = e.changedTouches[0].clientX - touchStartXRef.current
+        const dy = e.changedTouches[0].clientY - touchStartYRef.current
+        // Only handle horizontal swipes (|dx| > |dy| and |dx| > 40px threshold)
+        if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 40) {
+          if (dx < 0) seekTo(Math.min(currentPage + 1, pageCount))  // swipe left → next
+          else        seekTo(Math.max(currentPage - 1, 1))           // swipe right → prev
+        }
+      }}
+    >
 
       {/* Sliding strip */}
       <div
@@ -532,10 +617,20 @@ export default function ReaderPage() {
         {pageCount > 0 && (
           <div
             className="relative flex items-end gap-[2px] px-1 cursor-pointer transition-all duration-200"
-            style={{ height: barVisible ? '1.5rem' : '0.375rem' }}
+            style={{ height: barVisible ? '2rem' : '0.5rem' }}
             onMouseMove={barVisible ? handleBarMouseMove : undefined}
             onMouseLeave={() => setHoverPage(null)}
             onClick={() => { if (barVisible && hoverPage !== null) seekTo(hoverPage) }}
+            onTouchMove={e => {
+              if (!chapter?.page_count) return
+              const touch = e.touches[0]
+              const rect  = e.currentTarget.getBoundingClientRect()
+              const pct   = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width))
+              const page  = Math.max(1, Math.min(chapter.page_count, Math.ceil(pct * chapter.page_count) || 1))
+              setHoverPage(page)
+              setHoverX(touch.clientX - rect.left)
+            }}
+            onTouchEnd={() => { if (hoverPage !== null) seekTo(hoverPage) }}
             aria-label="Page navigation scrubber"
           >
             {/* Tooltip */}
@@ -614,7 +709,7 @@ export default function ReaderPage() {
               <button
                 onClick={() => seekTo(Math.max(currentPage - 1, 1))}
                 disabled={currentPage <= 1}
-                className="w-7 h-7 rounded-lg flex items-center justify-center text-zinc-400 hover:text-zinc-100 transition-colors disabled:opacity-25 disabled:cursor-default text-sm"
+                className="w-9 h-9 rounded-lg flex items-center justify-center text-zinc-400 hover:text-zinc-100 transition-colors disabled:opacity-25 disabled:cursor-default text-sm"
                 style={{ border: '1px solid rgba(139,92,246,0.2)' }}
                 aria-label="Previous page"
               >
@@ -628,7 +723,7 @@ export default function ReaderPage() {
               <button
                 onClick={() => seekTo(Math.min(currentPage + 1, pageCount))}
                 disabled={currentPage >= pageCount}
-                className="w-7 h-7 rounded-lg flex items-center justify-center text-zinc-400 hover:text-zinc-100 transition-colors disabled:opacity-25 disabled:cursor-default text-sm"
+                className="w-9 h-9 rounded-lg flex items-center justify-center text-zinc-400 hover:text-zinc-100 transition-colors disabled:opacity-25 disabled:cursor-default text-sm"
                 style={{ border: '1px solid rgba(139,92,246,0.2)' }}
                 aria-label="Next page"
               >
@@ -640,7 +735,7 @@ export default function ReaderPage() {
             <button
               ref={gearButtonRef}
               onClick={e => { e.stopPropagation(); setSettingsOpen(o => !o) }}
-              className="shrink-0 ml-2 w-7 h-7 rounded-lg flex items-center justify-center transition-all"
+              className="shrink-0 ml-2 w-9 h-9 rounded-lg flex items-center justify-center transition-all"
               style={{
                 border:     '1px solid rgba(139,92,246,0.2)',
                 color:      settingsOpen ? 'var(--accent)' : '#71717a',

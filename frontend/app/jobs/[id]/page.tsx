@@ -36,9 +36,6 @@ const STAGE_INFO: Record<string, { label: string; desc: string; icon: string; ve
   typeset:   { label: 'Typeset',   icon: '✍',  desc: 'Rendering Hebrew text with RTL support',  verb: 'Typesetting' },
 }
 
-// The 5 stages that run in parallel per-page (everything after download)
-const PIPELINE_STAGES: StageKey[] = ['detect', 'ocr', 'inpaint', 'translate', 'typeset']
-
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
 function makeInitialStages(): Record<string, StageState> {
@@ -293,25 +290,28 @@ export default function JobPage() {
 
   const totalElapsed = Date.now() - jobStartRef.current
 
-  // Total page count — whichever stage first reports it
-  const totalPages = stages.typeset?.total ?? stages.translate?.total ?? stages.detect?.total ?? null
-
-  // Pages fully done = typeset.page (last stage — a typeset page is end-to-end complete)
-  const pagesFullyDone = stages.typeset?.page ?? 0
-
-  // Overall progress: typeset page fraction is most meaningful (it's the last stage)
+  // Overall progress: each stage = equal weight; partial progress within running stage
   const overallPct = done ? 100 : (() => {
-    if (totalPages && totalPages > 0 &&
-        (stages.typeset?.status === 'running' || stages.typeset?.status === 'done')) {
-      return pct(stages.typeset.page, totalPages)
+    const stageWeight = 100 / STAGE_ORDER.length
+    let total = 0
+    for (const k of STAGE_ORDER) {
+      const s = stages[k]
+      if (s.status === 'done') {
+        total += stageWeight
+      } else if (s.status === 'running') {
+        if (s.page != null && s.total != null && s.total > 0) {
+          total += stageWeight * (s.page / s.total)
+        } else {
+          total += stageWeight * 0.1  // indeterminate but started
+        }
+        break
+      }
     }
-    // Fall back to stage-completion fraction
-    const doneCount = STAGE_ORDER.filter(k => stages[k].status === 'done').length
-    return Math.round((doneCount / STAGE_ORDER.length) * 100)
+    return Math.round(total)
   })()
 
-  const runningStages = STAGE_ORDER.filter(k => stages[k].status === 'running')
-  const pipelineActive = PIPELINE_STAGES.some(k => stages[k].status !== 'waiting')
+  // Active stage (the one currently running)
+  const activeStage = STAGE_ORDER.find(k => stages[k].status === 'running')
   const isRunning = !done && !error
 
   const backendUrl = process.env.NEXT_PUBLIC_BACKEND_URL ?? 'http://localhost:8000'
@@ -355,8 +355,10 @@ export default function JobPage() {
                 ? 'Complete'
                 : error
                 ? 'Stopped'
-                : totalPages
-                ? `${pagesFullyDone} / ${totalPages} pages done`
+                : activeStage && stages[activeStage]?.page != null && stages[activeStage]?.total != null
+                ? `${STAGE_INFO[activeStage].label}: ${stages[activeStage].page} / ${stages[activeStage].total} pages`
+                : activeStage
+                ? `${STAGE_INFO[activeStage].label}…`
                 : `${overallPct}%`}
             </span>
             <span className="tabular-nums">{fmt(tick > 0 || done ? totalElapsed : 0)}</span>
@@ -369,90 +371,8 @@ export default function JobPage() {
               style={{ width: `${overallPct}%` }}
             />
           </div>
-          {/* Parallel pipeline indicator */}
-          {runningStages.length > 1 && (
-            <p className="text-xs text-blue-400/70">
-              ⚡ {runningStages.length} stages running in parallel
-            </p>
-          )}
         </div>
       </div>
-
-      {/* Parallel pipeline strip — compact overview of the 5 per-page stages */}
-      {pipelineActive && (
-        <div className="w-full max-w-2xl mb-4 animate-fade-in">
-          <div className="card px-4 py-3">
-            <p className="text-xs font-semibold text-zinc-600 uppercase tracking-wide mb-2.5">
-              Per-page pipeline
-            </p>
-            <div className="flex gap-1.5">
-              {PIPELINE_STAGES.map(key => {
-                const s = stages[key]
-                const progress = pct(s.page, s.total)
-                const isActive = s.status === 'running' || s.status === 'done'
-                return (
-                  <div key={key} className="flex-1 min-w-0">
-                    <div className={`rounded-lg px-2 py-2 border transition-all duration-300 ${
-                      s.status === 'done'    ? 'bg-green-950/30 border-green-800/50' :
-                      s.status === 'running' ? 'bg-blue-950/40 border-blue-700/60' :
-                      s.status === 'error'   ? 'bg-red-950/30 border-red-800/50' :
-                                               'bg-zinc-900/40 border-zinc-800/40'
-                    }`}>
-                      {/* Status icon + page count */}
-                      <div className="flex items-center justify-between mb-1">
-                        <span className={`text-sm leading-none ${
-                          s.status === 'done'    ? 'text-green-400' :
-                          s.status === 'running' ? 'text-blue-300' :
-                          s.status === 'error'   ? 'text-red-400'  : 'text-zinc-600'
-                        }`}>
-                          {s.status === 'done'    ? '✓' :
-                           s.status === 'running' ? '⟳' :
-                           s.status === 'error'   ? '✗' :
-                           STAGE_INFO[key].icon}
-                        </span>
-                        {s.status === 'running' && s.page != null && (
-                          <span className="text-xs text-blue-400/80 tabular-nums font-mono">
-                            {s.page}
-                          </span>
-                        )}
-                        {s.status === 'done' && s.total != null && (
-                          <span className="text-xs text-green-600/80 tabular-nums font-mono">
-                            {s.total}
-                          </span>
-                        )}
-                      </div>
-
-                      {/* Stage name */}
-                      <p className={`text-xs truncate ${
-                        s.status === 'done'    ? 'text-zinc-500' :
-                        s.status === 'running' ? 'text-zinc-400' : 'text-zinc-600'
-                      }`}>
-                        {STAGE_INFO[key].label}
-                      </p>
-
-                      {/* Mini progress bar */}
-                      {isActive && (
-                        <div className="mt-1.5 h-1 bg-zinc-800 rounded-full overflow-hidden">
-                          {s.status === 'done' || (s.page != null && s.total != null) ? (
-                            <div
-                              className={`h-full rounded-full transition-all duration-500 ${
-                                s.status === 'done' ? 'bg-green-500' : 'bg-blue-500'
-                              }`}
-                              style={{ width: `${s.status === 'done' ? 100 : progress}%` }}
-                            />
-                          ) : (
-                            <div className="h-full w-1/2 bg-blue-500/50 rounded-full animate-pulse" />
-                          )}
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* Stage list */}
       <div className="w-full max-w-2xl card p-2 mb-4 animate-slide-in">

@@ -5,8 +5,7 @@ import { useRouter } from 'next/navigation'
 import Link from 'next/link'
 import MangaCover from '@/components/MangaCover'
 import Spinner from '@/components/Spinner'
-import ApiKeyModal from '@/components/ApiKeyModal'
-import { getApiHeaders, hasGeminiKey } from '@/lib/apiKeys'
+import { getApiHeaders, getGeminiKey, getModalTokens, hasGeminiKey, hasModalTokens } from '@/lib/apiKeys'
 import { cacheGet, cacheSet } from '@/lib/cache'
 
 // ── Shared normalised types ────────────────────────────────────────────────────
@@ -84,7 +83,7 @@ interface WCChapter {
 
 // ── MangaDex helpers ──────────────────────────────────────────────────────────
 
-const MD_API = 'https://api.mangadex.org'
+const MD_API = '/api/mangadex'
 
 function getMDTitle(m: MDManga): string {
   const t = m.attributes.title
@@ -119,13 +118,14 @@ async function fetchAllMDChapters(mangaId: string): Promise<MDChapter[]> {
   const limit = 100
 
   for (;;) {
-    const url = new URL(`${MD_API}/manga/${mangaId}/feed`)
-    url.searchParams.set('translatedLanguage[]', 'en')
-    url.searchParams.set('order[chapter]', 'asc')
-    url.searchParams.set('limit', String(limit))
-    url.searchParams.set('offset', String(offset))
+    const query = [
+      'translatedLanguage[]=en',
+      'order[chapter]=asc',
+      `limit=${limit}`,
+      `offset=${offset}`,
+    ].join('&')
 
-    const res = await fetch(url.toString())
+    const res = await fetch(`${MD_API}/manga/${mangaId}/feed?${query}`)
     if (!res.ok) break
 
     const json  = await res.json()
@@ -176,8 +176,6 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
   const [translating,  setTranslating]  = useState<string | null>(null)
 
   // ── API key gate ──────────────────────────────────────────────────────────
-  const [keyGateOpen, setKeyGateOpen] = useState(false)
-  const [pendingCh,   setPendingCh]   = useState<NormalizedChapter | null>(null)
 
   // ── Phase 1: fetch series metadata (cached 10 min) ────────────────────────
 
@@ -319,10 +317,17 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
   const handleTranslate = useCallback(async (ch: NormalizedChapter) => {
     setTranslating(ch.key)
     try {
+      const { tokenId, tokenSecret } = getModalTokens()
       const res  = await fetch('/api/jobs/from-url', {
         method:  'POST',
         headers: { 'Content-Type': 'application/json', ...getApiHeaders() },
-        body:    JSON.stringify({ url: ch.translateUrl, data_saver: false }),
+        body:    JSON.stringify({
+          url:                ch.translateUrl,
+          data_saver:         false,
+          gemini_api_key:     getGeminiKey(),
+          modal_token_id:     tokenId     || undefined,
+          modal_token_secret: tokenSecret || undefined,
+        }),
       })
       const data = await res.json()
       if (!res.ok) throw new Error(data.detail ?? 'Failed to start')
@@ -516,10 +521,10 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
       </div>
 
       {/* ── Chapter list header + controls ── */}
-      <div className="flex items-start justify-between gap-3 mb-3 flex-wrap">
+      <div className="flex flex-col sm:flex-row sm:items-end gap-3 mb-3">
 
-        {/* Left: "Chapters" title + batch chips (max 60% so they don't crowd the filters) */}
-        <div className="flex-1 min-w-0" style={{ maxWidth: '60%' }}>
+        {/* Left: "Chapters" title + batch chips */}
+        <div className="flex-1 min-w-0">
           <h2 className="text-lg font-bold text-zinc-100 mb-2">Chapters</h2>
           {!chapLoading && totalBatches > 1 && (
             <div className="flex flex-wrap gap-1.5">
@@ -543,10 +548,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
 
         {/* Right: filter + sort — anchored to the right */}
         {!chapLoading && (
-          <div
-            className="flex items-center gap-2 flex-wrap shrink-0"
-            style={{ margin: 'auto', marginBottom: '0px', marginRight: '0px' }}
-          >
+          <div className="flex items-center gap-2 flex-wrap">
             <div
               className="flex items-center gap-1 p-1 rounded-xl text-xs"
               style={{ background: 'var(--card-bg)', border: '1px solid var(--card-border)' }}
@@ -560,7 +562,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
                   }`}
                   style={filter === f ? { background: 'var(--accent)' } : undefined}
                 >
-                  {f === 'translated' ? '✓ Hebrew' : f === 'untranslated' ? '○ Untranslated' : 'All'}
+                  {f === 'translated' ? '✓ Hebrew' : f === 'untranslated' ? <span><span className="hidden sm:inline">○ </span>Untranslated</span> : 'All'}
                 </button>
               ))}
             </div>
@@ -582,7 +584,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
           {Array.from({ length: 6 }).map((_, i) => (
             <div
               key={i}
-              className="flex items-center gap-4 px-4 py-3.5 border-b border-zinc-800/40 last:border-0 animate-pulse"
+              className="flex items-center gap-4 px-4 py-4 border-b border-zinc-800/40 last:border-0 animate-pulse"
             >
               <div className="w-2 h-2 rounded-full bg-zinc-700 shrink-0" />
               <div className="flex-1 space-y-1.5">
@@ -619,7 +621,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
             return (
               <div
                 key={ch.key}
-                className="group flex items-center gap-3 px-4 py-3 hover:bg-[var(--accent-subtle)] transition-colors"
+                className="group flex items-center gap-3 px-4 py-3.5 hover:bg-[var(--accent-subtle)] transition-colors"
               >
                 {/* Status dot */}
                 <div
@@ -651,7 +653,7 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
                   <div className="shrink-0 flex items-center gap-1.5">
                     <Link
                       href={`/library/${libEntry.id}`}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-colors"
+                      className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-colors"
                       style={{
                         background: 'rgba(34,197,94,0.12)',
                         border:     '1px solid rgba(34,197,94,0.3)',
@@ -678,19 +680,19 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
                   <div className="shrink-0 flex items-center gap-1.5">
                     <button
                       onClick={() => {
-                        if (!hasGeminiKey()) {
-                          setPendingCh(ch)
-                          setKeyGateOpen(true)
+                        if (!hasGeminiKey() || !hasModalTokens()) {
+                          router.push('/settings')
                         } else {
                           handleTranslate(ch)
                         }
                       }}
                       disabled={isBusy || translating !== null}
-                      className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                      className="flex items-center gap-1.5 px-3 py-2 rounded-lg text-xs font-semibold transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                       style={{
                         background: 'var(--accent-subtle)',
                         border:     '1px solid var(--card-border-hover)',
                         color:      '#c4b5fd',
+                        minHeight:  'auto',
                       }}
                       title="Translate this chapter to Hebrew"
                     >
@@ -718,19 +720,6 @@ export default function SeriesDetailPage({ id, source }: SeriesDetailPageProps) 
           })}
         </div>
       )}
-
-      {/* API key gate — shown when user tries to translate without a key */}
-      <ApiKeyModal
-        open={keyGateOpen}
-        onClose={() => { setKeyGateOpen(false); setPendingCh(null) }}
-        onSave={() => {/* NavBar refreshes its own state on mount */}}
-        onConfirm={() => {
-          setKeyGateOpen(false)
-          const ch = pendingCh
-          setPendingCh(null)
-          if (ch) handleTranslate(ch)
-        }}
-      />
 
     </main>
   )

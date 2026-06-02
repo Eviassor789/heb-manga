@@ -4,11 +4,13 @@ import asyncio
 import json
 import os
 import shutil
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -41,6 +43,9 @@ MAX_FILE_SIZE_MB = 200
 ALLOWED_EXTENSIONS = {".pdf", ".zip"}
 
 job_manager = JobManager()
+
+# True when the server itself is configured to use Modal (no per-user tokens needed).
+_SERVER_USES_MODAL = os.getenv("USE_MODAL", "false").lower() == "true"
 
 
 # ---------------------------------------------------------------------------
@@ -107,8 +112,13 @@ async def _startup_scan_library() -> None:
 # ---------------------------------------------------------------------------
 
 class FetchChapterBody(BaseModel):
-    url:        str
-    data_saver: bool = False
+    url:               str
+    data_saver:        bool = False
+    # API keys can be sent in the body (preferred) or as X-* headers (fallback).
+    # Body keys are more reliable — some proxies/CORS pre-flight strips custom headers.
+    gemini_api_key:    str | None = None
+    modal_token_id:    str | None = None
+    modal_token_secret: str | None = None
 
 
 _RESUME_STEPS = {"detect", "ocr", "inpaint", "translate", "typeset"}
@@ -141,22 +151,37 @@ def _create_job_dirs(job_id: str) -> Path:
     return job_dir
 
 
-def _save_job_config(job_dir: Path, request: Request) -> None:
+def _save_job_config(
+    job_dir:            Path,
+    request:            Request,
+    gemini_api_key:     str | None = None,
+    modal_token_id:     str | None = None,
+    modal_token_secret: str | None = None,
+) -> None:
     """
-    Persist per-job settings supplied by the client as request headers.
+    Persist per-job API credentials to job_config.json.
 
-    Stored fields:
-      gemini_api_key  — X-Gemini-Api-Key (user's Gemini key for OCR + translation)
+    Keys can arrive two ways (body-supplied args take priority over headers):
+      - As JSON body fields (FetchChapterBody.gemini_api_key / modal_token_*)
+      - As request headers X-Gemini-Api-Key / X-Modal-Token-Id / X-Modal-Token-Secret
 
-    The key lives only in job_config.json inside the job directory and is removed
-    when the job is deleted.  It is NEVER stored in any database.
-    GPU processing (Modal) and storage (R2/Supabase) always use the server's own keys.
+    All keys live only in job_config.json and are never stored in any database.
     """
     config: dict = {}
 
-    gemini_key = request.headers.get("X-Gemini-Api-Key", "").strip()
+    # Prefer explicitly-passed values (from JSON body); fall back to headers.
+    gemini_key = (gemini_api_key or "").strip() or \
+                 (request.headers.get("X-Gemini-Api-Key") or "").strip()
     if gemini_key:
         config["gemini_api_key"] = gemini_key
+
+    mid = (modal_token_id     or "").strip() or \
+          (request.headers.get("X-Modal-Token-Id") or "").strip()
+    sec = (modal_token_secret or "").strip() or \
+          (request.headers.get("X-Modal-Token-Secret") or "").strip()
+    if mid and sec:
+        config["modal_token_id"]     = mid
+        config["modal_token_secret"] = sec
 
     (job_dir / "job_config.json").write_text(
         json.dumps(config, ensure_ascii=False),
@@ -164,13 +189,67 @@ def _save_job_config(job_dir: Path, request: Request) -> None:
     )
 
 
+def _require_api_keys(request: Request, body: "FetchChapterBody | None" = None) -> None:
+    """
+    Hard gate: every job creation must supply a Gemini API key.
+    Modal GPU tokens are also required unless the server has USE_MODAL=true.
+
+    Checks body fields first (JSON body), then X-* headers as fallback.
+    Raises HTTPException 422 if any required credential is absent.
+    """
+    gemini_key = (
+        (getattr(body, "gemini_api_key", None) or "").strip()
+        or (request.headers.get("X-Gemini-Api-Key") or "").strip()
+    )
+    if not gemini_key:
+        raise HTTPException(
+            status_code=422,
+            detail="A Gemini API key is required. Add it in Settings.",
+        )
+    if not _SERVER_USES_MODAL:
+        modal_id = (
+            (getattr(body, "modal_token_id", None) or "").strip()
+            or (request.headers.get("X-Modal-Token-Id") or "").strip()
+        )
+        modal_sec = (
+            (getattr(body, "modal_token_secret", None) or "").strip()
+            or (request.headers.get("X-Modal-Token-Secret") or "").strip()
+        )
+        if not (modal_id and modal_sec):
+            raise HTTPException(
+                status_code=422,
+                detail="Modal GPU tokens (Token ID + Token Secret) are required. Add them in Settings.",
+            )
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.post("/api/jobs", status_code=201)
-async def create_job(request: Request, file: UploadFile = File(...)):
-    """Accept a .pdf or .zip upload, spin up the translation pipeline."""
+async def create_job(
+    request:            Request,
+    file:               UploadFile = File(...),
+    gemini_api_key:     str | None = Form(default=None),
+    modal_token_id:     str | None = Form(default=None),
+    modal_token_secret: str | None = Form(default=None),
+):
+    """Accept a .pdf or .zip upload, spin up the translation pipeline.
+
+    API keys can be provided as form fields (preferred — more reliable than
+    headers for multipart/form-data) or as X-* request headers (fallback).
+    """
+    # Build a lightweight body-like object so _require_api_keys can check form
+    # fields with the same logic it uses for the JSON body on from-url jobs.
+    class _FormKeys:
+        pass
+    _form_body = _FormKeys()
+    _form_body.gemini_api_key    = gemini_api_key     # type: ignore[attr-defined]
+    _form_body.modal_token_id    = modal_token_id      # type: ignore[attr-defined]
+    _form_body.modal_token_secret = modal_token_secret # type: ignore[attr-defined]
+
+    _require_api_keys(request, _form_body)  # type: ignore[arg-type]
+
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -187,7 +266,12 @@ async def create_job(request: Request, file: UploadFile = File(...)):
 
     job_id  = str(uuid.uuid4())
     job_dir = _create_job_dirs(job_id)
-    _save_job_config(job_dir, request)
+    _save_job_config(
+        job_dir, request,
+        gemini_api_key=gemini_api_key,
+        modal_token_id=modal_token_id,
+        modal_token_secret=modal_token_secret,
+    )
 
     upload_path = job_dir / f"source{suffix}"
     upload_path.write_bytes(content)
@@ -212,6 +296,8 @@ async def create_job_from_url(request: Request, body: FetchChapterBody):
       { "job_id": null, "cached": true, "library_id": "<uuid>" }
     and no pipeline is started.  The frontend should redirect to /library/<library_id>.
     """
+    _require_api_keys(request, body)
+
     # ── Library cache check ────────────────────────────────────────────────────
     try:
         mangadex_id = extract_chapter_id(body.url)
@@ -223,7 +309,12 @@ async def create_job_from_url(request: Request, body: FetchChapterBody):
 
     job_id  = str(uuid.uuid4())
     job_dir = _create_job_dirs(job_id)
-    _save_job_config(job_dir, request)
+    _save_job_config(
+        job_dir, request,
+        gemini_api_key=body.gemini_api_key,
+        modal_token_id=body.modal_token_id,
+        modal_token_secret=body.modal_token_secret,
+    )
 
     job_manager.register_job(job_id)
     asyncio.create_task(
@@ -375,6 +466,68 @@ async def resume_job(job_id: str, body: ResumeBody):
 
 
 # ---------------------------------------------------------------------------
+# Modal BYOK — one-time deploy to user's workspace
+# ---------------------------------------------------------------------------
+
+class ModalSetupBody(BaseModel):
+    modal_token_id:     str
+    modal_token_secret: str
+
+
+@app.post("/api/modal/setup")
+async def modal_setup(body: ModalSetupBody):
+    """
+    Deploy modal_gpu.py to the user's own Modal workspace using their credentials.
+
+    This is a one-time setup step (~45 s).  After it completes the user's
+    account owns the deployed app and all GPU costs are billed to them.
+    The credentials are NOT stored server-side; the client saves them in
+    localStorage and sends them as headers on every pipeline job request.
+    """
+    tid = body.modal_token_id.strip()
+    sec = body.modal_token_secret.strip()
+    if not tid or not sec:
+        raise HTTPException(422, "Both modal_token_id and modal_token_secret are required.")
+
+    modal_script = Path(__file__).parent / "modal_gpu.py"
+    if not modal_script.exists():
+        raise HTTPException(500, "modal_gpu.py not found on the server.")
+
+    deploy_env = {
+        **os.environ,
+        "MODAL_TOKEN_ID":   tid,
+        "MODAL_TOKEN_SECRET": sec,
+        # Force UTF-8 I/O so the Modal CLI can print its box-drawing characters
+        # on Windows without hitting a charmap UnicodeEncodeError.
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8":       "1",
+    }
+
+    # asyncio.create_subprocess_exec raises NotImplementedError on Windows with
+    # SelectorEventLoop (used by uvicorn).  Run the blocking subprocess.run call
+    # in a thread instead — safe on all platforms, keeps the event loop free.
+    def _run_deploy() -> subprocess.CompletedProcess:
+        return subprocess.run(
+            [sys.executable, "-m", "modal", "deploy", str(modal_script)],
+            env=deploy_env,
+            capture_output=True,
+            encoding="utf-8",
+            errors="replace",   # replace any remaining undecodable bytes rather than crash
+        )
+
+    try:
+        result = await asyncio.to_thread(_run_deploy)
+    except FileNotFoundError:
+        raise HTTPException(500, "modal package not found in this Python environment. Run: pip install modal")
+
+    output = (result.stdout + result.stderr).strip()
+    if result.returncode != 0:
+        raise HTTPException(500, f"Modal deploy failed: {output[-2000:]}")
+
+    return {"success": True}
+
+
+# ---------------------------------------------------------------------------
 # Intermediate-file cleanup
 # ---------------------------------------------------------------------------
 
@@ -399,20 +552,6 @@ async def _cleanup_intermediates(job_dir: Path) -> None:
 # Pipelined orchestrator — per-page parallel pipeline (Steps 1–5)
 # ---------------------------------------------------------------------------
 
-# How many pages to process concurrently through the full pipeline.
-# Each "slot" runs detect→ocr→inpaint→translate→typeset independently, so
-# page N+1 can start detection while page N is still awaiting its OCR result.
-# Single-thread executors inside each module naturally serialise CPU-heavy
-# steps (YOLO detect, LaMa inpaint, Pillow typeset) while async steps
-# (Gemini OCR, Gemini translate) overlap with CPU work on other pages.
-#
-# Sensible values:
-#   3 (default) — good overlap without overwhelming local CPU/RAM
-#   1           — equivalent to the old sequential-stage approach
-#   5+          — useful with USE_MODAL=true (GPU parallelism) or fast hardware
-_PIPELINE_CONCURRENCY = max(1, int(os.getenv("PIPELINE_CONCURRENCY", "3")))
-
-
 async def _run_pipeline_steps(
     job_id:  str,
     job_dir: Path,
@@ -420,168 +559,29 @@ async def _run_pipeline_steps(
     emit,
 ) -> None:
     """
-    Run Steps 1–5 of the pipeline and emit the final 'done' event.
+    Run Steps 1–5 of the pipeline in strict stage-by-stage order.
 
-    Pages flow through detect → ocr → inpaint → translate → typeset in
-    parallel: while page N is awaiting its Gemini OCR response, page N+1 is
-    already running detection, and page N-1 may already be inpainting.
+    All pages complete each stage before the next stage begins:
+      detect ALL pages → ocr ALL pages → inpaint ALL pages
+      → translate ALL pages → typeset ALL pages
 
-    Concurrency is bounded by PIPELINE_CONCURRENCY (default 3) and, for
-    Gemini API calls, by TRANSLATION_CONCURRENCY (default 1 for free tier).
+    Each stage module handles its own per-page progress events and emits
+    its own 'done' event (including cost/modal_gpu_seconds metadata).
     """
-    total = len(pages)
-
-    # ── Per-job API key ─────────────────────────────────────────────────────
     cfg_path = job_dir / "job_config.json"
     job_cfg  = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
-    user_api_key: str | None = job_cfg.get("gemini_api_key") or None
+    modal_token_id:     str | None = job_cfg.get("modal_token_id")    or None
+    modal_token_secret: str | None = job_cfg.get("modal_token_secret") or None
 
-    # ── Shared translator state ─────────────────────────────────────────────
-    glossary      = translator._load_glossary(job_dir)
-    glossary_lock = asyncio.Lock()
-
-    # ── Concurrency controls ────────────────────────────────────────────────
-    # pipeline_sem: max concurrent in-flight page pipelines
-    # translate_sem: Gemini translate API concurrency (respects free-tier RPM)
-    pipeline_sem  = asyncio.Semaphore(_PIPELINE_CONCURRENCY)
-    translate_sem = asyncio.Semaphore(
-        max(1, int(os.getenv("TRANSLATION_CONCURRENCY", "1")))
-    )
-
-    # ── Accumulators shared across page coroutines ──────────────────────────
-    counters     = {s: 0 for s in ("detect", "ocr", "inpaint", "translate", "typeset")}
-    counter_lock = asyncio.Lock()
-
-    ocr_tokens = {"input": 0, "output": 0, "think": 0}
-    tr_tokens  = {"input": 0, "output": 0, "think": 0}
-    tokens_lock = asyncio.Lock()
-
-    modal_inpaint_secs = 0.0
-    modal_lock         = asyncio.Lock()
-
-    # Track which stages have had their initial "running" event emitted
-    stage_started: set[str] = set()
-    started_lock  = asyncio.Lock()
-
-    async def _emit_stage_start(stage: str) -> None:
-        async with started_lock:
-            if stage not in stage_started:
-                stage_started.add(stage)
-                await emit({"stage": stage, "status": "running"})
-
-    # Emit the first stage immediately so the frontend transitions right away
-    await emit({"stage": "detect", "status": "running"})
-    stage_started.add("detect")
-
-    # Pre-warm LaMa so the first inpaint page doesn't pay the model-load cost
-    # while detect/OCR for later pages are already queued up.
-    if not os.getenv("USE_MODAL", "false").lower() == "true":
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(None, inpainter._get_lama)
-
-    async def _process_page(page_path: Path) -> None:
-        nonlocal modal_inpaint_secs
-
-        async with pipeline_sem:
-            # ── Step 1: Detect ──────────────────────────────────────────────
-            await detector.detect_one_page(page_path, job_dir / "detection")
-            async with counter_lock:
-                counters["detect"] += 1
-                n = counters["detect"]
-            await emit({"stage": "detect", "status": "running", "page": n, "total": total})
-
-            # ── Step 2: OCR ─────────────────────────────────────────────────
-            await _emit_stage_start("ocr")
-            toks = await ocr.ocr_one_page(page_path, job_dir / "detection", user_api_key)
-            async with tokens_lock:
-                for k in toks:
-                    ocr_tokens[k] += toks[k]
-            async with counter_lock:
-                counters["ocr"] += 1
-                n = counters["ocr"]
-            await emit({"stage": "ocr", "status": "running", "page": n, "total": total})
-
-            # ── Step 3: Inpaint ─────────────────────────────────────────────
-            await _emit_stage_start("inpaint")
-            ms = await inpainter.inpaint_one_page(page_path, job_dir)
-            async with modal_lock:
-                modal_inpaint_secs += ms
-            async with counter_lock:
-                counters["inpaint"] += 1
-                n = counters["inpaint"]
-            await emit({"stage": "inpaint", "status": "running", "page": n, "total": total})
-
-            # ── Step 4: Translate (serialised by translate_sem) ─────────────
-            await _emit_stage_start("translate")
-            async with translate_sem:
-                toks = await translator.translate_one_page(
-                    page_path, job_dir, glossary, glossary_lock, user_api_key
-                )
-            async with tokens_lock:
-                for k in toks:
-                    tr_tokens[k] += toks[k]
-            async with counter_lock:
-                counters["translate"] += 1
-                n = counters["translate"]
-            await emit({"stage": "translate", "status": "running", "page": n, "total": total})
-
-            # ── Step 5: Typeset ─────────────────────────────────────────────
-            await _emit_stage_start("typeset")
-            await typesetter.typeset_one_page(page_path, job_dir)
-            async with counter_lock:
-                counters["typeset"] += 1
-                n = counters["typeset"]
-            await emit({"stage": "typeset", "status": "running", "page": n, "total": total})
-
-    # Run all page pipelines concurrently (bounded by pipeline_sem)
-    await asyncio.gather(*(_process_page(p) for p in pages))
-
-    # ── Emit stage "done" events with cost/metrics ──────────────────────────
-    await emit({"stage": "detect", "status": "done", "total_pages": total,
-                "modal_gpu_seconds": 0.0})
-
-    ocr_cost: dict | None = None
-    if sum(ocr_tokens.values()) > 0:
-        cost_usd = (
-            ocr_tokens["input"]  / 1_000_000 * ocr._PRICE_INPUT_PER_M +
-            ocr_tokens["output"] / 1_000_000 * ocr._PRICE_OUTPUT_PER_M +
-            ocr_tokens["think"]  / 1_000_000 * ocr._PRICE_THINK_PER_M
-        )
-        ocr_cost = {
-            "usd": round(cost_usd, 4),
-            "ils": round(cost_usd * ocr._ILS_PER_USD, 4),
-            "tokens": {**ocr_tokens, "total": sum(ocr_tokens.values())},
-        }
-    await emit({
-        "stage": "ocr", "status": "done", "total_pages": total,
-        "modal_gpu_seconds": 0,
-        **({"cost": ocr_cost} if ocr_cost else {}),
-    })
-
-    await emit({"stage": "inpaint", "status": "done", "total_pages": total,
-                "modal_gpu_seconds": round(modal_inpaint_secs, 2)})
-
-    tr_cost_usd = (
-        tr_tokens["input"]  / 1_000_000 * translator._PRICE_INPUT_PER_M +
-        tr_tokens["output"] / 1_000_000 * translator._PRICE_OUTPUT_PER_M +
-        tr_tokens["think"]  / 1_000_000 * translator._PRICE_THINK_PER_M
-    )
-    await emit({
-        "stage": "translate", "status": "done", "total_pages": total,
-        "cost": {
-            "usd": round(tr_cost_usd, 4),
-            "ils": round(tr_cost_usd * translator._ILS_PER_USD, 4),
-            "tokens": {**tr_tokens, "total": sum(tr_tokens.values())},
-        },
-    })
-
-    # Assemble final PDF after all pages are typeset
-    await typesetter.assemble_pdf(job_dir)
-    await emit({"stage": "typeset", "status": "done", "total_pages": total})
+    await detector.detect(job_dir, pages, emit, modal_token_id, modal_token_secret)
+    await ocr.ocr(job_dir, pages, emit)
+    await inpainter.inpaint(job_dir, pages, emit, modal_token_id, modal_token_secret)
+    await translator.translate(job_dir, pages, emit)
+    await typesetter.typeset(job_dir, pages, emit)
 
     await emit({
         "stage":        "done",
-        "total_pages":  total,
+        "total_pages":  len(pages),
         "download_url": f"/api/jobs/{job_id}/download",
     })
 
@@ -606,6 +606,11 @@ async def _run_pipeline(job_id: str, source_file: Path) -> None:
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})
+        # Delete the failed job directory so it doesn't accumulate on disk.
+        try:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 async def _run_pipeline_from_url(
@@ -635,6 +640,11 @@ async def _run_pipeline_from_url(
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})
+        # Delete the failed job directory so it doesn't accumulate on disk.
+        try:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1427,3 +1437,8 @@ async def _run_pipeline_from_step(
 
     except Exception as exc:
         await emit({"stage": "error", "message": str(exc)})
+        # Delete the failed job directory so it doesn't accumulate on disk.
+        try:
+            shutil.rmtree(job_dir, ignore_errors=True)
+        except Exception:
+            pass

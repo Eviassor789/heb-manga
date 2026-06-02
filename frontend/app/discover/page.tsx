@@ -33,7 +33,7 @@ interface WCManga {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
-const MD_API      = 'https://api.mangadex.org'
+const MD_API      = '/api/mangadex'
 const ALL_RATINGS = ['safe', 'suggestive']
 const MD_EXCLUDED_TAGS = [
   'aafb99d1-7f60-43fa-b75f-fc9502ce29c7', // Harem
@@ -52,14 +52,18 @@ function getCoverUrl(m: MDManga): string | null {
 }
 
 async function fetchMangaDex(extra: Record<string, string>): Promise<MDManga[]> {
-  const url = new URL(`${MD_API}/manga`)
-  url.searchParams.set('limit', '24')
-  url.searchParams.set('includes[]', 'cover_art')
-  url.searchParams.set('availableTranslatedLanguage[]', 'en')
-  ALL_RATINGS.forEach(r => url.searchParams.append('contentRating[]', r))
-  MD_EXCLUDED_TAGS.forEach(id => url.searchParams.append('excludedTags[]', id))
-  for (const [k, v] of Object.entries(extra)) url.searchParams.set(k, v)
-  const res = await fetch(url.toString())
+  // Build query manually — URLSearchParams encodes [] to %5B%5D which some
+  // proxy layers don't round-trip correctly for MangaDex's array parameters.
+  const base = [
+    'limit=24',
+    'includes[]=cover_art',
+    'availableTranslatedLanguage[]=en',
+    ...ALL_RATINGS.map(r  => `contentRating[]=${encodeURIComponent(r)}`),
+    ...MD_EXCLUDED_TAGS.map(id => `excludedTags[]=${encodeURIComponent(id)}`),
+  ]
+  const extras = Object.entries(extra).map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(v)}`)
+  const query = [...base, ...extras].join('&')
+  const res = await fetch(`${MD_API}/manga?${query}`)
   if (!res.ok) throw new Error('MangaDex request failed')
   return (await res.json()).data ?? []
 }

@@ -1,18 +1,24 @@
 """
 Async retry utility with exponential backoff.
 
-Designed for the Gemini free tier (15 RPM) but generic enough to wrap any
-coroutine that may raise HTTP 429 / quota-exhausted errors.
+Handles two distinct Gemini error categories:
 
-Delay schedule with default settings (base_delay=60 s, max_delay=120 s, jitter=5 s):
+  429 / quota-exhausted  — rate limit; base_delay=60 s (aligned with Gemini's
+                           1-minute RPM window).
+  503 / UNAVAILABLE      — server overload spike; base_delay=15 s (spikes
+                           usually resolve within 30–60 s).
 
-  attempt 1  →  ~60  s
-  attempt 2  →  ~120 s  (capped — would be 120 without cap)
-  attempt 3  →  ~120 s  (capped — would be 240)
-  attempt 4  →  ~120 s  (capped — would be 480)
+Delay schedule for 429 (base=60 s, max=120 s, jitter=5 s):
+  attempt 1  →  ~60 s
+  attempt 2  →  ~120 s  (capped)
+  attempt 3+ →  ~120 s  (capped)
 
-The base delay of 60 s is aligned with Gemini's 1-minute RPM reset window.
-max_delay=120 s keeps total wait time sane for long chapters.
+Delay schedule for 503 (base=15 s, max=120 s, jitter=5 s):
+  attempt 1  →  ~15 s
+  attempt 2  →  ~30 s
+  attempt 3  →  ~60 s
+  attempt 4  →  ~120 s  (capped)
+  attempt 5+ →  ~120 s  (capped)
 """
 
 from __future__ import annotations
@@ -27,10 +33,11 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
-_DEFAULT_BASE_DELAY  = 60.0    # seconds — matches Gemini's RPM reset window
-_DEFAULT_MAX_DELAY   = 120.0   # hard ceiling — never wait longer than this
-_DEFAULT_MAX_RETRIES = 5
-_DEFAULT_JITTER      = 5.0     # random seconds added to avoid thundering herd
+_DEFAULT_BASE_DELAY         = 60.0    # seconds for 429 rate-limit errors
+_DEFAULT_SERVER_BASE_DELAY  = 15.0    # seconds for 503 server-overload errors
+_DEFAULT_MAX_DELAY          = 120.0   # hard ceiling for all retries
+_DEFAULT_MAX_RETRIES        = 5
+_DEFAULT_JITTER             = 5.0     # random seconds added to avoid thundering herd
 
 
 class RateLimitError(Exception):
@@ -40,29 +47,33 @@ class RateLimitError(Exception):
 async def call_with_backoff(
     coro_fn: Callable[[], Coroutine[Any, Any, T]],
     *,
-    max_retries: int  = _DEFAULT_MAX_RETRIES,
-    base_delay:  float = _DEFAULT_BASE_DELAY,
-    max_delay:   float = _DEFAULT_MAX_DELAY,
-    jitter:      float = _DEFAULT_JITTER,
+    max_retries:       int   = _DEFAULT_MAX_RETRIES,
+    base_delay:        float = _DEFAULT_BASE_DELAY,
+    server_base_delay: float = _DEFAULT_SERVER_BASE_DELAY,
+    max_delay:         float = _DEFAULT_MAX_DELAY,
+    jitter:            float = _DEFAULT_JITTER,
 ) -> T:
     """
-    Call coro_fn() and retry on 429 / quota errors with exponential backoff.
+    Call coro_fn() and retry on transient Gemini errors with exponential backoff.
+
+    Retries on:
+      • 429 / quota-exhausted  — uses base_delay (default 60 s)
+      • 503 / UNAVAILABLE      — uses server_base_delay (default 15 s)
+
+    All other exceptions are re-raised immediately without retrying.
 
     Parameters
     ----------
-    coro_fn     : Zero-argument callable that returns a fresh coroutine each
-                  call — e.g. ``lambda: model.generate_content_async(msg)``.
-                  A new coroutine is needed for each attempt because a consumed
-                  coroutine cannot be awaited again.
-    max_retries : Maximum number of *retry* attempts (not counting the first).
-    base_delay  : Seconds for the first retry delay.
-    max_delay   : Hard ceiling on any single delay (before jitter).
-    jitter      : Maximum random seconds added to each delay to spread load.
+    coro_fn           : Zero-argument callable returning a fresh coroutine each call.
+    max_retries       : Maximum *retry* attempts (not counting the first call).
+    base_delay        : First-retry delay for 429 rate-limit errors.
+    server_base_delay : First-retry delay for 503 server-overload errors.
+    max_delay         : Hard ceiling on any single delay (before jitter).
+    jitter            : Max random seconds added per delay to spread load.
 
     Raises
     ------
     RateLimitError  if all retries are exhausted.
-    Any other exception is re-raised immediately without retrying.
     """
     last_exc: Exception | None = None
 
@@ -71,49 +82,54 @@ async def call_with_backoff(
             return await coro_fn()
 
         except Exception as exc:
-            if not _is_rate_limit(exc):
-                raise   # non-429 errors bubble up immediately
+            is_rate   = _is_rate_limit(exc)
+            is_server = _is_server_overloaded(exc)
+
+            if not is_rate and not is_server:
+                raise   # unrecognised error — bubble up immediately
 
             last_exc = exc
 
             if attempt == max_retries:
                 break   # fall through to RateLimitError
 
-            delay = min(base_delay * (2 ** attempt), max_delay) + random.uniform(0, jitter)
+            effective_base = base_delay if is_rate else server_base_delay
+            delay = min(effective_base * (2 ** attempt), max_delay) + random.uniform(0, jitter)
+            kind  = "429/quota" if is_rate else "503/unavailable"
             log.warning(
-                "[rate_limiter] 429 / quota error (attempt %d/%d). "
-                "Retrying in %.0f s …",
-                attempt + 1,
-                max_retries,
-                delay,
+                "[rate_limiter] %s (attempt %d/%d). Retrying in %.0f s …",
+                kind, attempt + 1, max_retries, delay,
             )
             await asyncio.sleep(delay)
 
     raise RateLimitError(
-        f"Gemini rate limit hit on every attempt ({max_retries + 1} total). "
-        "Consider reducing the number of pages per job or upgrading to a "
-        "paid API tier."
+        f"Gemini API unavailable after {max_retries + 1} attempts. "
+        "This is usually a temporary spike — try resuming the job from the "
+        "Translate step in the job progress page."
     ) from last_exc
 
 
 def _is_rate_limit(exc: Exception) -> bool:
-    """
-    Return True if exc looks like an HTTP 429 / quota-exhausted error.
-
-    The Gemini SDK raises different types across versions:
-      • google.api_core.exceptions.ResourceExhausted  (most common)
-      • grpc.StatusCode.RESOURCE_EXHAUSTED
-      • Plain exceptions whose message contains '429' or 'quota'
-
-    We check both type name and string representation for robustness.
-    """
+    """Return True for HTTP 429 / quota-exhausted errors."""
     type_name = type(exc).__name__
     exc_str   = str(exc).lower()
-
     return (
         type_name in {"ResourceExhausted", "TooManyRequests"}
-        or "429"    in exc_str
-        or "quota"  in exc_str
-        or "rate"   in exc_str
+        or "429"       in exc_str
+        or "quota"     in exc_str
+        or "rate"      in exc_str
         or "exhausted" in exc_str
+    )
+
+
+def _is_server_overloaded(exc: Exception) -> bool:
+    """Return True for HTTP 503 / ServiceUnavailable (temporary high-demand) errors."""
+    type_name = type(exc).__name__
+    exc_str   = str(exc).lower()
+    return (
+        type_name in {"ServiceUnavailable", "Unavailable"}
+        or "503"         in exc_str
+        or "unavailable" in exc_str
+        or "high demand" in exc_str
+        or "overloaded"  in exc_str
     )

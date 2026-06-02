@@ -553,13 +553,21 @@ async def upload_chapter_files(
     elif pdf_exists and not pages_exist:
         import io as _io
         from PIL import Image as _Img  # noqa: PLC0415
-        page_pngs = sorted(p for p in output_dir.glob("*.png") if p.stem.isdigit())
+        # Accept .jpg (new default) and .png (old jobs) — JPEG first in sort order
+        page_imgs = sorted(
+            p for p in output_dir.iterdir()
+            if p.stem.isdigit() and p.suffix.lower() in (".jpg", ".jpeg", ".png")
+        )
         pages_dir.mkdir(exist_ok=True)
-        for p in page_pngs:
-            img = _Img.open(p).convert("RGB")
-            buf = _io.BytesIO()
-            img.save(buf, format="JPEG", quality=65, optimize=True, subsampling=2)
-            (pages_dir / f"{p.stem}.jpg").write_bytes(buf.getvalue())
+        for p in page_imgs:
+            if p.suffix.lower() in (".jpg", ".jpeg"):
+                # Already JPEG — copy bytes directly, no re-encode
+                (pages_dir / f"{p.stem}.jpg").write_bytes(p.read_bytes())
+            else:
+                img = _Img.open(p).convert("RGB")
+                buf = _io.BytesIO()
+                img.save(buf, format="JPEG", quality=85, optimize=True, subsampling=2)
+                (pages_dir / f"{p.stem}.jpg").write_bytes(buf.getvalue())
 
     page_paths = sorted(pages_dir.glob("*.jpg"))
     page_count = len(page_paths)
@@ -606,10 +614,10 @@ def _cleanup_local_output(output_dir: Path) -> None:
         compressed = output_dir / "result_compressed.pdf"
         if compressed.exists():
             compressed.unlink(missing_ok=True)
-        # Remove the large per-page PNGs that live directly in output/
-        for png in output_dir.glob("*.png"):
-            if png.stem.isdigit():
-                png.unlink(missing_ok=True)
+        # Remove per-page images that live directly in output/ (jpg = new, png = legacy)
+        for img in output_dir.iterdir():
+            if img.stem.isdigit() and img.suffix.lower() in (".jpg", ".jpeg", ".png"):
+                img.unlink(missing_ok=True)
         log.debug("[library] Cleaned local output at %s", output_dir)
     except Exception as exc:
         log.warning("[library] _cleanup_local_output failed: %s", exc)
