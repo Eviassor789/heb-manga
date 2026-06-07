@@ -3,10 +3,12 @@
 import { useEffect, useLayoutEffect, useRef, useState, useCallback } from 'react'
 import { useParams, useRouter } from 'next/navigation'
 import { cacheGet, cacheSet } from '@/lib/cache'
+import { getGeminiKey, getModalTokens, getApiHeaders } from '@/lib/apiKeys'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
-type ReadDirection = 'ttb' | 'ltr'
+type ReadDirection  = 'ttb' | 'ltr'
+type EndCardState  = 'loading' | 'translated' | 'untranslated' | 'caught-up'
 
 interface Chapter {
   id:            string
@@ -67,6 +69,13 @@ export default function ReaderPage() {
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [direction,    setDirection]    = useState<ReadDirection>('ttb')
   const [zoom,         setZoom]         = useState(ZOOM_DEFAULT)
+
+  // ── End-of-chapter card state ─────────────────────────────────────────────
+  const [endCardState,     setEndCardState]     = useState<EndCardState>('loading')
+  const [nextChapter,      setNextChapter]      = useState<Chapter | null>(null)
+  const [nextChapterUrl,   setNextChapterUrl]   = useState<string | null>(null)
+  const [nextChapterLabel, setNextChapterLabel] = useState<string>('')
+  const [translating,      setTranslating]      = useState(false)
 
   const pageRefs        = useRef<(HTMLDivElement | null)[]>([])
   // Refs for individual slides in LTR mode — used to reset scrollTop on page change.
@@ -179,6 +188,96 @@ export default function ReaderPage() {
       .catch(err  => { setError(err.message); setLoading(false) })
   }, [id])
 
+  // ── Discover next chapter (translated / untranslated / caught-up) ───────────
+
+  useEffect(() => {
+    if (!chapter) return
+
+    const currentNum = parseFloat(chapter.chapter_num ?? '')
+    if (!chapter.manga_id || isNaN(currentNum)) {
+      setEndCardState('caught-up')
+      return
+    }
+
+    let cancelled = false
+
+    ;(async () => {
+      // Step 1 — check our own library for an already-translated next chapter
+      try {
+        const r = await fetch(`/api/library/manga/${chapter.manga_id}`)
+        if (cancelled) return
+        const { chapters: libChapters } = r.ok
+          ? (await r.json() as { chapters: Chapter[] })
+          : { chapters: [] as Chapter[] }
+
+        const sorted = libChapters
+          .filter(c => c.id !== id && !isNaN(parseFloat(c.chapter_num ?? '')))
+          .sort((a, b) => parseFloat(a.chapter_num!) - parseFloat(b.chapter_num!))
+        const next = sorted.find(c => parseFloat(c.chapter_num!) > currentNum)
+
+        if (next) {
+          if (cancelled) return
+          setNextChapter(next)
+          setNextChapterLabel(`Chapter ${next.chapter_num}`)
+          setEndCardState('translated')
+          return
+        }
+      } catch { /* fall through */ }
+
+      if (cancelled) return
+
+      // Step 2 — check the source platform for an untranslated next chapter
+      try {
+        if (chapter.mangadex_id?.startsWith('wc:')) {
+          // WeebCentral
+          const r = await fetch(`/api/weebcentral/series/${chapter.manga_id}/chapters`)
+          if (cancelled) return
+          if (!r.ok) throw new Error()
+          const { chapters: wcChapters } = await r.json() as {
+            chapters: Array<{ id: string; number: string; title: string; url: string }>
+          }
+          const wcSorted = wcChapters
+            .filter(c => !isNaN(parseFloat(c.number)))
+            .sort((a, b) => parseFloat(a.number) - parseFloat(b.number))
+          const wcNext = wcSorted.find(c => parseFloat(c.number) > currentNum)
+          if (wcNext) {
+            if (cancelled) return
+            setNextChapterUrl(wcNext.url)
+            setNextChapterLabel(`Chapter ${wcNext.number}`)
+            setEndCardState('untranslated')
+            return
+          }
+        } else {
+          // MangaDex — query the chapter feed for anything after currentNum
+          const params = new URLSearchParams({
+            limit: '1',
+            'order[chapter]': 'asc',
+            'translatedLanguage[]': 'en',
+            chapter: String(currentNum + 0.0001),
+          })
+          const r = await fetch(
+            `https://api.mangadex.org/manga/${chapter.manga_id}/feed?${params}`
+          )
+          if (cancelled) return
+          if (!r.ok) throw new Error()
+          const data = await r.json()
+          if (data.data?.length > 0) {
+            const mdNext   = data.data[0]
+            const mdNum    = mdNext.attributes?.chapter ?? ''
+            setNextChapterUrl(`https://mangadex.org/chapter/${mdNext.id}`)
+            setNextChapterLabel(`Chapter ${mdNum}`)
+            setEndCardState('untranslated')
+            return
+          }
+        }
+      } catch { /* fall through to caught-up */ }
+
+      if (!cancelled) setEndCardState('caught-up')
+    })()
+
+    return () => { cancelled = true }
+  }, [chapter, id])
+
   // ── Persist reading progress to localStorage (for "Continue Reading" row) ──
 
   useEffect(() => {
@@ -193,7 +292,8 @@ export default function ReaderPage() {
         cover_url:   chapter.cover_url ?? null,
         chapter_id:  id,
         chapter_num: chapter.chapter_num ?? null,
-        page_num:    currentPage,
+        // Cap at page_count so the end-card slide index is never persisted.
+        page_num:    Math.min(currentPage, chapter.page_count ?? currentPage),
         page_count:  chapter.page_count ?? null,
         last_read:   new Date().toISOString(),
       }
@@ -271,19 +371,46 @@ export default function ReaderPage() {
     seekTimerRef.current = setTimeout(() => { seekingRef.current = false }, 750)
   }, [direction, scrollToPage])
 
+  // ── Trigger translation of the next (untranslated) chapter ──────────────────
+
+  const translateNext = useCallback(async () => {
+    if (!nextChapterUrl || translating) return
+    setTranslating(true)
+    try {
+      const body: Record<string, string> = { url: nextChapterUrl }
+      const geminiKey = getGeminiKey()
+      const { tokenId, tokenSecret } = getModalTokens()
+      if (geminiKey)              body.gemini_api_key    = geminiKey
+      if (tokenId && tokenSecret) { body.modal_token_id = tokenId; body.modal_token_secret = tokenSecret }
+
+      const res = await fetch('/api/jobs/from-url', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json', ...getApiHeaders() },
+        body:    JSON.stringify(body),
+      })
+      if (!res.ok) throw new Error(await res.text())
+      const data = await res.json()
+      router.push(data.cached && data.library_id ? `/library/${data.library_id}` : `/jobs/${data.job_id}`)
+    } catch {
+      setTranslating(false)
+    }
+  }, [nextChapterUrl, translating, router])
+
   // ── Keyboard navigation ────────────────────────────────────────────────────
 
   useEffect(() => {
-    const count = chapter?.page_count ?? 0
+    const count  = chapter?.page_count ?? 0
+    // In LTR mode the end card is slide pageCount+1; arrow keys can reach it.
+    const maxNav = direction === 'ltr' && count > 0 ? count + 1 : count
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'ArrowRight' || e.key === 'ArrowDown')
-        seekTo(Math.min(currentPage + 1, count))
+        seekTo(Math.min(currentPage + 1, maxNav))
       else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp')
         seekTo(Math.max(currentPage - 1, 1))
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [chapter?.page_count, currentPage, seekTo])
+  }, [chapter?.page_count, currentPage, seekTo, direction])
 
   // ── Bottom bar auto-show/hide via mouse proximity ─────────────────────────
 
@@ -382,6 +509,11 @@ export default function ReaderPage() {
     : chapter.chapter_title ?? ''
   const backUrl      = getBackUrl(chapter)
 
+  // In LTR mode the end card occupies one extra slide after the last page.
+  const maxPage = direction === 'ltr' && pageCount > 0 ? pageCount + 1 : pageCount
+  // Display-only page number — never shows the end-card slide index.
+  const displayPage = Math.min(currentPage, pageCount)
+
   // ── Horizontal single-page viewer ─────────────────────────────────────────
 
   const renderHorizontal = () => (
@@ -396,8 +528,8 @@ export default function ReaderPage() {
         const dy = e.changedTouches[0].clientY - touchStartYRef.current
         // Only handle horizontal swipes (|dx| > |dy| and |dx| > 40px threshold)
         if (Math.abs(dx) > Math.abs(dy) && Math.abs(dx) > 40) {
-          if (dx < 0) seekTo(Math.min(currentPage + 1, pageCount))  // swipe left → next
-          else        seekTo(Math.max(currentPage - 1, 1))           // swipe right → prev
+          if (dx < 0) seekTo(Math.min(currentPage + 1, maxPage))  // swipe left → next
+          else        seekTo(Math.max(currentPage - 1, 1))          // swipe right → prev
         }
       }}
     >
@@ -408,45 +540,57 @@ export default function ReaderPage() {
         style={{ transform: `translateX(${-(currentPage - 1) * 100}%)` }}
       >
         {pagesPrefix && pageCount > 0 ? (
-          Array.from({ length: pageCount }, (_, i) => i + 1).map(n => (
-            <div
-              key={n}
-              ref={el => { ltrSlideRefs.current[n - 1] = el }}
-              className={`flex-shrink-0 flex justify-center bg-zinc-950 ${zoom > 1 ? 'items-start' : 'items-center'}`}
-              style={{
-                width:     '100vw',
-                height:    '100%',
-                minWidth:  '100vw',
-                // Allow vertical scrolling when zoomed in so the user can see the
-                // full page. Clip horizontal to avoid interference with the
-                // translateX slide strip.
-                overflowX: 'hidden',
-                overflowY: zoom > 1 ? 'auto' : 'hidden',
-              }}
-            >
-              {/* eslint-disable-next-line @next/next/no-img-element */}
-              <img
-                src={pageUrl(pagesPrefix, n)}
-                alt={`Page ${n}`}
-                className="select-none"
+          <>
+            {Array.from({ length: pageCount }, (_, i) => i + 1).map(n => (
+              <div
+                key={n}
+                ref={el => { ltrSlideRefs.current[n - 1] = el }}
+                className={`flex-shrink-0 flex justify-center bg-zinc-950 ${zoom > 1 ? 'items-start' : 'items-center'}`}
                 style={{
-                  // Size the image box as a fraction of the slide container.
-                  // zoom > 1 → box overflows the slide (overflow:hidden clips it,
-                  //            showing a center-crop of the enlarged page).
-                  // zoom < 1 → box is smaller than the slide, centred with black margins.
-                  // object-fit:contain keeps the manga aspect ratio intact.
-                  width:    `${zoom * 100}%`,
-                  height:   `${zoom * 100}%`,
-                  objectFit: 'contain',
-                  flexShrink: 0,
-                  paddingBottom: '3.5rem',
+                  width:     '100vw',
+                  height:    '100%',
+                  minWidth:  '100vw',
+                  overflowX: 'hidden',
+                  overflowY: zoom > 1 ? 'auto' : 'hidden',
                 }}
-                loading={Math.abs(n - currentPage) <= 1 ? 'eager' : 'lazy'}
-                decoding="async"
-                draggable={false}
+              >
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={pageUrl(pagesPrefix, n)}
+                  alt={`Page ${n}`}
+                  className="select-none"
+                  style={{
+                    width:         `${zoom * 100}%`,
+                    height:        `${zoom * 100}%`,
+                    objectFit:     'contain',
+                    flexShrink:    0,
+                    paddingBottom: '3.5rem',
+                  }}
+                  loading={Math.abs(n - currentPage) <= 1 ? 'eager' : 'lazy'}
+                  decoding="async"
+                  draggable={false}
+                />
+              </div>
+            ))}
+
+            {/* End-of-chapter card — final slide */}
+            <div
+              key="end-card"
+              className="flex-shrink-0 bg-zinc-950"
+              style={{ width: '100vw', height: '100%', minWidth: '100vw', overflowY: 'auto' }}
+            >
+              <EndCard
+                chapter={chapter}
+                endCardState={endCardState}
+                nextChapter={nextChapter}
+                nextChapterLabel={nextChapterLabel}
+                translating={translating}
+                onTranslate={translateNext}
+                backUrl={backUrl}
+                onBack={() => router.push(backUrl)}
               />
             </div>
-          ))
+          </>
         ) : (
           <div
             className="flex-shrink-0 flex items-center justify-center"
@@ -472,7 +616,7 @@ export default function ReaderPage() {
           <div
             className="absolute right-0 top-0 h-full z-10 cursor-pointer"
             style={{ width: '15%', bottom: '3.5rem' }}
-            onClick={() => seekTo(Math.min(currentPage + 1, pageCount))}
+            onClick={() => seekTo(Math.min(currentPage + 1, maxPage))}
             aria-label="Next page"
           />
         </>
@@ -485,32 +629,46 @@ export default function ReaderPage() {
   const renderVertical = () => (
     <div className="pb-6">
       {pagesPrefix && pageCount > 0 ? (
-        Array.from({ length: pageCount }, (_, i) => i + 1).map(n => (
-          <div
-            key={n}
-            ref={el => { pageRefs.current[n - 1] = el }}
-            data-page={n}
-            className="mx-auto mb-1"
-            style={{ maxWidth: `${Math.round(TTB_BASE_WIDTH_PX * zoom)}px` }}
-          >
-            {/* eslint-disable-next-line @next/next/no-img-element */}
-            <img
-              src={pageUrl(pagesPrefix, n)}
-              alt={`Page ${n}`}
-              className="w-full block"
-              loading={n <= 3 ? 'eager' : 'lazy'}
-              decoding="async"
-              onError={e => {
-                const img = e.target as HTMLImageElement
-                img.style.display = 'none'
-                img.nextElementSibling?.classList.remove('hidden')
-              }}
-            />
-            <div className="hidden bg-zinc-900 border border-zinc-800 rounded-lg py-12 text-center text-zinc-600 text-sm">
-              Page {n} unavailable
+        <>
+          {Array.from({ length: pageCount }, (_, i) => i + 1).map(n => (
+            <div
+              key={n}
+              ref={el => { pageRefs.current[n - 1] = el }}
+              data-page={n}
+              className="mx-auto mb-1"
+              style={{ maxWidth: `${Math.round(TTB_BASE_WIDTH_PX * zoom)}px` }}
+            >
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img
+                src={pageUrl(pagesPrefix, n)}
+                alt={`Page ${n}`}
+                className="w-full block"
+                loading={n <= 3 ? 'eager' : 'lazy'}
+                decoding="async"
+                onError={e => {
+                  const img = e.target as HTMLImageElement
+                  img.style.display = 'none'
+                  img.nextElementSibling?.classList.remove('hidden')
+                }}
+              />
+              <div className="hidden bg-zinc-900 border border-zinc-800 rounded-lg py-12 text-center text-zinc-600 text-sm">
+                Page {n} unavailable
+              </div>
             </div>
-          </div>
-        ))
+          ))}
+
+          {/* End-of-chapter card — scrolled to at the bottom of the TTB strip */}
+          <EndCard
+            chapter={chapter}
+            endCardState={endCardState}
+            nextChapter={nextChapter}
+            nextChapterLabel={nextChapterLabel}
+            translating={translating}
+            onTranslate={translateNext}
+            backUrl={backUrl}
+            onBack={() => router.push(backUrl)}
+          />
+        </>
       ) : (
         <div className="max-w-3xl mx-auto pt-32 text-center space-y-4">
           <p className="text-zinc-500 text-sm">Page images not available.</p>
@@ -653,7 +811,7 @@ export default function ReaderPage() {
             {/* Segments */}
             {Array.from({ length: pageCount }, (_, i) => {
               const page      = i + 1
-              const isRead    = page <= currentPage
+              const isRead    = page <= displayPage
               const isHovered = barVisible && page === hoverPage
               return (
                 <div
@@ -717,12 +875,12 @@ export default function ReaderPage() {
               </button>
 
               <span className="text-xs tabular-nums font-mono text-zinc-300 min-w-[3rem] text-center">
-                {currentPage}<span className="text-zinc-600"> / </span>{pageCount}
+                {displayPage}<span className="text-zinc-600"> / </span>{pageCount}
               </span>
 
               <button
-                onClick={() => seekTo(Math.min(currentPage + 1, pageCount))}
-                disabled={currentPage >= pageCount}
+                onClick={() => seekTo(Math.min(currentPage + 1, maxPage))}
+                disabled={currentPage >= maxPage}
                 className="w-9 h-9 rounded-lg flex items-center justify-center text-zinc-400 hover:text-zinc-100 transition-colors disabled:opacity-25 disabled:cursor-default text-sm"
                 style={{ border: '1px solid rgba(139,92,246,0.2)' }}
                 aria-label="Next page"
@@ -752,6 +910,164 @@ export default function ReaderPage() {
           </div>
         </div>
 
+      </div>
+    </div>
+  )
+}
+
+// ── End-of-chapter card ───────────────────────────────────────────────────────
+
+function EndCard({
+  chapter,
+  endCardState,
+  nextChapter,
+  nextChapterLabel,
+  translating,
+  onTranslate,
+  onBack,
+}: {
+  chapter:          Chapter
+  endCardState:     EndCardState
+  nextChapter:      Chapter | null
+  nextChapterLabel: string
+  translating:      boolean
+  onTranslate:      () => void
+  backUrl:          string   // kept for the parent's convenience; onBack wraps it
+  onBack:           () => void
+}) {
+  const chapterLabel = chapter.chapter_num
+    ? `Chapter ${chapter.chapter_num}${chapter.chapter_title ? ` — ${chapter.chapter_title}` : ''}`
+    : chapter.chapter_title ?? 'Chapter'
+
+  return (
+    <div
+      className="w-full flex items-center justify-center"
+      style={{
+        minHeight: '100vh',
+        background: 'radial-gradient(ellipse at 50% 40%, rgba(232,121,168,0.07) 0%, transparent 65%)',
+      }}
+    >
+      <div className="flex flex-col items-center text-center px-8 gap-7 max-w-xs w-full pb-20">
+
+        {/* Completion badge */}
+        <div
+          className="w-20 h-20 rounded-full flex items-center justify-center"
+          style={{
+            background: 'var(--accent-subtle)',
+            border:     '1.5px solid var(--card-border-hover)',
+            boxShadow:  '0 0 48px var(--accent-glow)',
+          }}
+        >
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none"
+            stroke="var(--accent)" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+            <polyline points="20 6 9 17 4 12" />
+          </svg>
+        </div>
+
+        {/* Title block */}
+        <div className="space-y-1">
+          <p className="text-xs font-semibold tracking-wide" style={{ color: 'var(--accent)' }}>
+            {chapterLabel} Complete
+          </p>
+          <p className="text-2xl font-bold text-zinc-100 leading-snug">
+            {chapter.manga_title}
+          </p>
+        </div>
+
+        <div className="w-12 h-px" style={{ background: 'var(--card-border-hover)' }} />
+
+        {/* Dynamic section — changes based on endCardState */}
+        {endCardState === 'loading' && (
+          <div className="w-full space-y-3">
+            <div className="h-3 rounded-full bg-zinc-800 animate-pulse w-20 mx-auto" />
+            <div className="h-12 rounded-xl bg-zinc-800 animate-pulse w-full" />
+          </div>
+        )}
+
+        {endCardState === 'translated' && nextChapter && (
+          <div className="w-full space-y-3">
+            <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">
+              Up Next
+            </p>
+            <p className="text-sm text-zinc-300 leading-snug">
+              {nextChapterLabel}
+              {nextChapter.chapter_title && (
+                <span className="text-zinc-500"> — {nextChapter.chapter_title}</span>
+              )}
+            </p>
+            {/* Use <a> so Next.js App Router soft-navigates without a full reload */}
+            <a
+              href={`/library/${nextChapter.id}`}
+              className="btn-primary w-full py-3 text-sm font-semibold flex items-center justify-center gap-2"
+              style={{ textDecoration: 'none' }}
+            >
+              Continue Reading
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M5 12h14M12 5l7 7-7 7" />
+              </svg>
+            </a>
+          </div>
+        )}
+
+        {endCardState === 'untranslated' && (
+          <div className="w-full space-y-3">
+            <p className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">
+              Up Next
+            </p>
+            <p className="text-sm text-zinc-400 leading-snug">
+              {nextChapterLabel}
+              <span className="ml-1.5 text-zinc-600 text-xs">not yet translated</span>
+            </p>
+            <button
+              onClick={onTranslate}
+              disabled={translating}
+              className="btn-primary w-full py-3 text-sm font-semibold flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-default"
+            >
+              {translating ? (
+                <>
+                  <svg className="animate-spin h-4 w-4 shrink-0" viewBox="0 0 24 24" fill="none">
+                    <circle className="opacity-25" cx="12" cy="12" r="10"
+                      stroke="currentColor" strokeWidth="4" />
+                    <path className="opacity-75" fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                  </svg>
+                  Starting translation…
+                </>
+              ) : (
+                <>
+                  <svg width="14" height="14" viewBox="0 0 24 24" fill="none"
+                    stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" />
+                  </svg>
+                  Translate {nextChapterLabel}
+                </>
+              )}
+            </button>
+          </div>
+        )}
+
+        {endCardState === 'caught-up' && (
+          <div className="space-y-2">
+            <p className="text-3xl">🎌</p>
+            <p className="text-sm font-semibold text-zinc-200">You&apos;re all caught up!</p>
+            <p className="text-xs text-zinc-500 leading-relaxed">
+              New chapters will appear here as they&apos;re translated.
+            </p>
+          </div>
+        )}
+
+        {/* Back to series — always shown */}
+        <button
+          onClick={onBack}
+          className="text-xs text-zinc-600 hover:text-zinc-300 transition-colors flex items-center gap-1.5 mt-1"
+        >
+          <svg width="11" height="11" viewBox="0 0 24 24" fill="none"
+            stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M19 12H5M12 19l-7-7 7-7" />
+          </svg>
+          Back to Series
+        </button>
       </div>
     </div>
   )
