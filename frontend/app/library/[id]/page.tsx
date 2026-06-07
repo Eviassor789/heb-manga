@@ -113,6 +113,10 @@ export default function ReaderPage() {
     return () => document.removeEventListener('mousedown', handleDown)
   }, [settingsOpen])
 
+  // ── Scroll to top on mount (prevents browser scroll-restoration mid-page) ──
+
+  useEffect(() => { window.scrollTo(0, 0) }, [])
+
   // ── Load preferences + saved page ────────────────────────────────────────
 
   useEffect(() => {
@@ -573,22 +577,35 @@ export default function ReaderPage() {
               </div>
             ))}
 
-            {/* End-of-chapter card — final slide */}
+            {/* End-of-chapter card — final slide, portrait box centred in the slide */}
             <div
               key="end-card"
-              className="flex-shrink-0 bg-zinc-950"
-              style={{ width: '100vw', height: '100%', minWidth: '100vw', overflowY: 'auto' }}
+              className="flex-shrink-0 flex items-center justify-center bg-zinc-950"
+              style={{ width: '100vw', height: '100%', minWidth: '100vw' }}
             >
-              <EndCard
-                chapter={chapter}
-                endCardState={endCardState}
-                nextChapter={nextChapter}
-                nextChapterLabel={nextChapterLabel}
-                translating={translating}
-                onTranslate={translateNext}
-                backUrl={backUrl}
-                onBack={() => router.push(backUrl)}
-              />
+              {/* Portrait page-like box — same feel as a real manga page */}
+              <div
+                className="flex items-center justify-center overflow-y-auto"
+                style={{
+                  // Height = full slide minus bottom bar; width = portrait ratio of that height
+                  height:     'calc(100% - 3.5rem)',
+                  width:      'calc((100% - 3.5rem) * 0.714)',  // 1/1.4 ≈ portrait ratio
+                  maxWidth:   '90vw',
+                  background: 'rgba(14, 14, 22, 0.95)',
+                  border:     '1px solid rgba(255,255,255,0.07)',
+                }}
+              >
+                <EndCard
+                  chapter={chapter}
+                  endCardState={endCardState}
+                  nextChapter={nextChapter}
+                  nextChapterLabel={nextChapterLabel}
+                  translating={translating}
+                  onTranslate={translateNext}
+                  backUrl={backUrl}
+                  onBack={() => router.push(backUrl)}
+                />
+              </div>
             </div>
           </>
         ) : (
@@ -643,6 +660,10 @@ export default function ReaderPage() {
                 src={pageUrl(pagesPrefix, n)}
                 alt={`Page ${n}`}
                 className="w-full block"
+                // aspect-ratio reserves portrait space before the image downloads,
+                // preventing the end card from appearing near the top on first render.
+                // The browser overrides it with the image's real dimensions once loaded.
+                style={{ aspectRatio: '3 / 4' }}
                 loading={n <= 3 ? 'eager' : 'lazy'}
                 decoding="async"
                 onError={e => {
@@ -657,17 +678,29 @@ export default function ReaderPage() {
             </div>
           ))}
 
-          {/* End-of-chapter card — scrolled to at the bottom of the TTB strip */}
-          <EndCard
-            chapter={chapter}
-            endCardState={endCardState}
-            nextChapter={nextChapter}
-            nextChapterLabel={nextChapterLabel}
-            translating={translating}
-            onTranslate={translateNext}
-            backUrl={backUrl}
-            onBack={() => router.push(backUrl)}
-          />
+          {/* End-of-chapter card — same width as pages, portrait-ratio, bordered */}
+          <div
+            className="mx-auto mb-1 flex items-center justify-center"
+            style={{
+              maxWidth:   `${Math.round(TTB_BASE_WIDTH_PX * zoom)}px`,
+              // Reserve the same portrait height as a typical manga page so the
+              // card has page-like proportions and the layout is stable.
+              minHeight:  `${Math.round(TTB_BASE_WIDTH_PX * zoom * 1.4)}px`,
+              background: 'rgba(14, 14, 22, 0.95)',
+              border:     '1px solid rgba(255,255,255,0.07)',
+            }}
+          >
+            <EndCard
+              chapter={chapter}
+              endCardState={endCardState}
+              nextChapter={nextChapter}
+              nextChapterLabel={nextChapterLabel}
+              translating={translating}
+              onTranslate={translateNext}
+              backUrl={backUrl}
+              onBack={() => router.push(backUrl)}
+            />
+          </div>
         </>
       ) : (
         <div className="max-w-3xl mx-auto pt-32 text-center space-y-4">
@@ -940,14 +973,7 @@ function EndCard({
     : chapter.chapter_title ?? 'Chapter'
 
   return (
-    <div
-      className="w-full flex items-center justify-center"
-      style={{
-        minHeight: '100vh',
-        background: 'radial-gradient(ellipse at 50% 40%, rgba(232,121,168,0.07) 0%, transparent 65%)',
-      }}
-    >
-      <div className="flex flex-col items-center text-center px-8 gap-7 max-w-xs w-full pb-20">
+    <div className="flex flex-col items-center text-center px-8 gap-7 max-w-xs w-full py-16">
 
         {/* Completion badge */}
         <div
@@ -1068,7 +1094,6 @@ function EndCard({
           </svg>
           Back to Series
         </button>
-      </div>
     </div>
   )
 }
