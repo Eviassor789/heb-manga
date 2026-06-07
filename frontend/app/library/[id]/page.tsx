@@ -113,9 +113,22 @@ export default function ReaderPage() {
     return () => document.removeEventListener('mousedown', handleDown)
   }, [settingsOpen])
 
-  // ── Scroll to top on mount (prevents browser scroll-restoration mid-page) ──
+  // ── Scroll to top (prevents browser scroll-restoration from opening mid-page) ─
 
-  useEffect(() => { window.scrollTo(0, 0) }, [])
+  useEffect(() => {
+    // Disable browser scroll restoration so navigating to this route always
+    // starts at the top, regardless of what the history stack remembers.
+    const prev = window.history.scrollRestoration
+    window.history.scrollRestoration = 'manual'
+    window.scrollTo(0, 0)
+    // Second pass on the next frame — catches React layout shifts that happen
+    // after the first synchronous render but before the browser paints.
+    const raf = requestAnimationFrame(() => window.scrollTo(0, 0))
+    return () => {
+      cancelAnimationFrame(raf)
+      window.history.scrollRestoration = prev
+    }
+  }, [])
 
   // ── Load preferences + saved page ────────────────────────────────────────
 
@@ -177,6 +190,18 @@ export default function ReaderPage() {
     const el = ltrSlideRefs.current[currentPage - 1]
     if (el) el.scrollTop = 0
   }, [currentPage])
+
+  // ── Scroll to top when chapter data arrives (unless resuming a saved page) ──
+  // The loading→content transition swaps the entire DOM subtree, which can
+  // trigger scroll-position drift.  Fire a scroll-to-top once the chapter
+  // object is set, but only when there is no saved position to restore.
+
+  useEffect(() => {
+    if (!chapter) return
+    if (!initialPageRef.current || initialPageRef.current <= 1) {
+      window.scrollTo(0, 0)
+    }
+  }, [chapter])
 
   // ── Fetch chapter metadata (cached 30 min — immutable after translation) ───
 
@@ -356,6 +381,8 @@ export default function ReaderPage() {
     )
     pageRefs.current.forEach(el => el && obs.observe(el))
     return () => obs.disconnect()
+  // chapter?.page_count changing means a new chapter loaded, which also means
+  // the end-card ref (pageRefs[pageCount]) has been added — re-observe everything.
   }, [chapter?.page_count, direction])
 
   // ── Scroll to page (TTB) ───────────────────────────────────────────────────
@@ -403,9 +430,9 @@ export default function ReaderPage() {
   // ── Keyboard navigation ────────────────────────────────────────────────────
 
   useEffect(() => {
-    const count  = chapter?.page_count ?? 0
-    // In LTR mode the end card is slide pageCount+1; arrow keys can reach it.
-    const maxNav = direction === 'ltr' && count > 0 ? count + 1 : count
+    const count = chapter?.page_count ?? 0
+    // maxNav = pageCount + 1 so arrow keys can reach the end card in both modes.
+    const maxNav = count > 0 ? count + 1 : count
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'ArrowRight' || e.key === 'ArrowDown')
         seekTo(Math.min(currentPage + 1, maxNav))
@@ -414,7 +441,7 @@ export default function ReaderPage() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [chapter?.page_count, currentPage, seekTo, direction])
+  }, [chapter?.page_count, currentPage, seekTo])
 
   // ── Bottom bar auto-show/hide via mouse proximity ─────────────────────────
 
@@ -478,14 +505,19 @@ export default function ReaderPage() {
 
   // ── Segment bar hover ──────────────────────────────────────────────────────
 
+  // handleBarMouseMove is defined after the chapter/maxPage are available in the
+  // render body; we forward the live maxPage value via a ref so the callback
+  // never becomes stale while still being stable across renders.
+  const maxPageRef = useRef(0)
+
   const handleBarMouseMove = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    if (!chapter?.page_count) return
+    if (!maxPageRef.current) return
     const { left, width } = e.currentTarget.getBoundingClientRect()
     const pct  = Math.max(0, Math.min(1, (e.clientX - left) / width))
-    const page = Math.max(1, Math.min(chapter.page_count, Math.ceil(pct * chapter.page_count) || 1))
+    const page = Math.max(1, Math.min(maxPageRef.current, Math.ceil(pct * maxPageRef.current) || 1))
     setHoverPage(page)
     setHoverX(e.clientX - left)
-  }, [chapter?.page_count])
+  }, [])
 
   // ── Render: loading / error ────────────────────────────────────────────────
 
@@ -513,9 +545,11 @@ export default function ReaderPage() {
     : chapter.chapter_title ?? ''
   const backUrl      = getBackUrl(chapter)
 
-  // In LTR mode the end card occupies one extra slide after the last page.
-  const maxPage = direction === 'ltr' && pageCount > 0 ? pageCount + 1 : pageCount
-  // Display-only page number — never shows the end-card slide index.
+  // The end card is always page (pageCount + 1) — reachable in both TTB and LTR.
+  const maxPage = pageCount > 0 ? pageCount + 1 : pageCount
+  // Keep the bar-scrubber callback up-to-date without recreating it every render.
+  maxPageRef.current = maxPage
+  // Counter text still shows "5 / 5" not "6 / 5" when on the end card.
   const displayPage = Math.min(currentPage, pageCount)
 
   // ── Horizontal single-page viewer ─────────────────────────────────────────
@@ -660,10 +694,6 @@ export default function ReaderPage() {
                 src={pageUrl(pagesPrefix, n)}
                 alt={`Page ${n}`}
                 className="w-full block"
-                // aspect-ratio reserves portrait space before the image downloads,
-                // preventing the end card from appearing near the top on first render.
-                // The browser overrides it with the image's real dimensions once loaded.
-                style={{ aspectRatio: '3 / 4' }}
                 loading={n <= 3 ? 'eager' : 'lazy'}
                 decoding="async"
                 onError={e => {
@@ -678,13 +708,13 @@ export default function ReaderPage() {
             </div>
           ))}
 
-          {/* End-of-chapter card — same width as pages, portrait-ratio, bordered */}
+          {/* End-of-chapter card — registered as page (pageCount+1) in the observer */}
           <div
+            ref={el => { pageRefs.current[pageCount] = el }}
+            data-page={pageCount + 1}
             className="mx-auto mb-1 flex items-center justify-center"
             style={{
               maxWidth:   `${Math.round(TTB_BASE_WIDTH_PX * zoom)}px`,
-              // Reserve the same portrait height as a typical manga page so the
-              // card has page-like proportions and the layout is stable.
               minHeight:  `${Math.round(TTB_BASE_WIDTH_PX * zoom * 1.4)}px`,
               background: 'rgba(14, 14, 22, 0.95)',
               border:     '1px solid rgba(255,255,255,0.07)',
@@ -813,11 +843,11 @@ export default function ReaderPage() {
             onMouseLeave={() => setHoverPage(null)}
             onClick={() => { if (barVisible && hoverPage !== null) seekTo(hoverPage) }}
             onTouchMove={e => {
-              if (!chapter?.page_count) return
+              if (!maxPageRef.current) return
               const touch = e.touches[0]
               const rect  = e.currentTarget.getBoundingClientRect()
               const pct   = Math.max(0, Math.min(1, (touch.clientX - rect.left) / rect.width))
-              const page  = Math.max(1, Math.min(chapter.page_count, Math.ceil(pct * chapter.page_count) || 1))
+              const page  = Math.max(1, Math.min(maxPageRef.current, Math.ceil(pct * maxPageRef.current) || 1))
               setHoverPage(page)
               setHoverX(touch.clientX - rect.left)
             }}
@@ -837,24 +867,31 @@ export default function ReaderPage() {
                   boxShadow:  '0 2px 8px rgba(0,0,0,0.5)',
                 }}
               >
-                {hoverPage}
+                {hoverPage > pageCount ? 'End' : hoverPage}
               </div>
             )}
 
-            {/* Segments */}
-            {Array.from({ length: pageCount }, (_, i) => {
-              const page      = i + 1
-              const isRead    = page <= displayPage
-              const isHovered = barVisible && page === hoverPage
+            {/* Segments — pageCount real pages + 1 end-card segment */}
+            {Array.from({ length: maxPage }, (_, i) => {
+              const page        = i + 1
+              const isEndCard   = page === maxPage
+              const isRead      = page <= currentPage
+              const isHovered   = barVisible && page === hoverPage
               return (
                 <div
                   key={i}
                   className="flex-1 rounded-[1px] transition-all duration-100"
                   style={{
                     minWidth:   0,
+                    // End-card segment is slightly wider to stand out as a landmark.
+                    flexGrow:   isEndCard ? 1.6 : 1,
                     height:     isHovered ? '10px' : barVisible ? '4px' : '3px',
-                    background: isRead ? 'var(--accent)' : 'rgba(63,63,70,0.7)',
+                    background: isRead
+                      ? isEndCard ? 'var(--accent-dim)' : 'var(--accent)'
+                      : 'rgba(63,63,70,0.7)',
                     boxShadow:  isRead && isHovered ? '0 0 6px var(--accent-glow)' : undefined,
+                    // Subtle gap before the end-card segment to visually separate it.
+                    marginLeft: isEndCard ? '3px' : undefined,
                   }}
                 />
               )
