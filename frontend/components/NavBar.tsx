@@ -98,7 +98,7 @@ export default function NavBar() {
 
           {/* Logo — left */}
           <Link href="/" className="flex items-center gap-2 shrink-0 z-10">
-            <span className="text-xl">🈺</span>
+            <img src="/hemanga-logo.png" alt="HeManga" className="w-7 h-7 rounded-md object-cover" />
             <span className="text-sm font-bold text-[var(--accent)] hidden sm:block tracking-wide">
               HeManga
             </span>
