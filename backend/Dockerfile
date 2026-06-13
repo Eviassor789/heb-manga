@@ -31,7 +31,20 @@ RUN pip install --upgrade pip && \
     pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
 COPY requirements.txt ./
-RUN pip install -r requirements.txt
+
+# simple-lama-inpainting==0.1.2 pins pillow<10 and numpy<2 in its own metadata.
+# Those pins are stale (the code works fine with pillow 10+/numpy 2.x, see the
+# comment in requirements.txt) but if resolved together with the rest of
+# requirements.txt, pip is forced to pick pillow==9.5.0 — which has no
+# Python 3.12 wheel, so pip falls back to building it from source and fails on
+# this slim image (no compiler/image-lib headers). Install everything else
+# first (pulls a modern pillow/numpy with prebuilt wheels), then install
+# simple-lama-inpainting with --no-deps so its stale pins never enter
+# resolution; its real runtime deps (torch, torchvision, opencv, numpy,
+# pillow) are already satisfied above, plus the tiny `fire` CLI dep.
+RUN grep -v '^simple-lama-inpainting' requirements.txt > requirements.core.txt && \
+    pip install -r requirements.core.txt && \
+    pip install --no-deps "simple-lama-inpainting==0.1.2" "fire>=0.5.0,<0.6.0"
 
 # Copy the application code.
 COPY . .
