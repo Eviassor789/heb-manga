@@ -1,6 +1,7 @@
 'use client'
 
 import { useState } from 'react'
+import { proxiedCoverUrl } from '@/lib/coverUrl'
 
 interface MangaCoverProps {
   src:       string | null | undefined
@@ -14,13 +15,14 @@ interface MangaCoverProps {
  */
 export default function MangaCover({ src, alt, className = '' }: MangaCoverProps) {
   const [failed, setFailed] = useState(false)
+  const resolvedSrc = proxiedCoverUrl(src)
 
   return (
     <div className={`relative w-full aspect-[2/3] bg-zinc-900 overflow-hidden ${className}`}>
-      {src && !failed ? (
+      {resolvedSrc && !failed ? (
         // eslint-disable-next-line @next/next/no-img-element
         <img
-          src={src}
+          src={resolvedSrc}
           alt={alt}
           className="absolute inset-0 w-full h-full object-cover"
           loading="lazy"

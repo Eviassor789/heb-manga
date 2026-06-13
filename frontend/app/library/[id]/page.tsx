@@ -113,22 +113,6 @@ export default function ReaderPage() {
     return () => document.removeEventListener('mousedown', handleDown)
   }, [settingsOpen])
 
-  // ── Scroll to top (prevents browser scroll-restoration from opening mid-page) ─
-
-  useEffect(() => {
-    // Disable browser scroll restoration so navigating to this route always
-    // starts at the top, regardless of what the history stack remembers.
-    const prev = window.history.scrollRestoration
-    window.history.scrollRestoration = 'manual'
-    window.scrollTo(0, 0)
-    // Second pass on the next frame — catches React layout shifts that happen
-    // after the first synchronous render but before the browser paints.
-    const raf = requestAnimationFrame(() => window.scrollTo(0, 0))
-    return () => {
-      cancelAnimationFrame(raf)
-      window.history.scrollRestoration = prev
-    }
-  }, [])
 
   // ── Load preferences + saved page ────────────────────────────────────────
 
@@ -190,18 +174,6 @@ export default function ReaderPage() {
     const el = ltrSlideRefs.current[currentPage - 1]
     if (el) el.scrollTop = 0
   }, [currentPage])
-
-  // ── Scroll to top when chapter data arrives (unless resuming a saved page) ──
-  // The loading→content transition swaps the entire DOM subtree, which can
-  // trigger scroll-position drift.  Fire a scroll-to-top once the chapter
-  // object is set, but only when there is no saved position to restore.
-
-  useEffect(() => {
-    if (!chapter) return
-    if (!initialPageRef.current || initialPageRef.current <= 1) {
-      window.scrollTo(0, 0)
-    }
-  }, [chapter])
 
   // ── Fetch chapter metadata (cached 30 min — immutable after translation) ───
 
@@ -694,6 +666,7 @@ export default function ReaderPage() {
                 src={pageUrl(pagesPrefix, n)}
                 alt={`Page ${n}`}
                 className="w-full block"
+                style={{ aspectRatio: '2/3' }}
                 loading={n <= 3 ? 'eager' : 'lazy'}
                 decoding="async"
                 onError={e => {
@@ -871,27 +844,20 @@ export default function ReaderPage() {
               </div>
             )}
 
-            {/* Segments — pageCount real pages + 1 end-card segment */}
+            {/* Segments — pageCount real pages + 1 end-card segment, all uniform */}
             {Array.from({ length: maxPage }, (_, i) => {
-              const page        = i + 1
-              const isEndCard   = page === maxPage
-              const isRead      = page <= currentPage
-              const isHovered   = barVisible && page === hoverPage
+              const page      = i + 1
+              const isRead    = page <= currentPage
+              const isHovered = barVisible && page === hoverPage
               return (
                 <div
                   key={i}
                   className="flex-1 rounded-[1px] transition-all duration-100"
                   style={{
-                    minWidth:   0,
-                    // End-card segment is slightly wider to stand out as a landmark.
-                    flexGrow:   isEndCard ? 1.6 : 1,
-                    height:     isHovered ? '10px' : barVisible ? '4px' : '3px',
-                    background: isRead
-                      ? isEndCard ? 'var(--accent-dim)' : 'var(--accent)'
-                      : 'rgba(63,63,70,0.7)',
-                    boxShadow:  isRead && isHovered ? '0 0 6px var(--accent-glow)' : undefined,
-                    // Subtle gap before the end-card segment to visually separate it.
-                    marginLeft: isEndCard ? '3px' : undefined,
+                    minWidth:  0,
+                    height:    isHovered ? '10px' : barVisible ? '4px' : '3px',
+                    background: isRead ? 'var(--accent)' : 'rgba(63,63,70,0.7)',
+                    boxShadow: isRead && isHovered ? '0 0 6px var(--accent-glow)' : undefined,
                   }}
                 />
               )

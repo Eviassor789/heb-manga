@@ -5,6 +5,7 @@ import Link from 'next/link'
 import MangaCard from '@/components/MangaCard'
 import SkeletonCard from '@/components/SkeletonCard'
 import { cacheGet, cacheSet } from '@/lib/cache'
+import { proxiedCoverUrl } from '@/lib/coverUrl'
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 
@@ -101,7 +102,9 @@ function getMDTitle(m: MDManga): string {
 function getMDCover(m: MDManga): string | null {
   const rel = m.relationships.find(r => r.type === 'cover_art')
   if (!rel?.attributes?.fileName) return null
-  return `https://uploads.mangadex.org/covers/${m.id}/${rel.attributes.fileName}.512.jpg`
+  // Routed through our server-side proxy — uploads.mangadex.org's hotlink
+  // protection blocks direct <img> requests whose Referer isn't mangadex.org.
+  return `/api/mangadex-cdn/covers/${m.id}/${rel.attributes.fileName}.512.jpg`
 }
 
 
@@ -569,7 +572,7 @@ export default function HomePage() {
     const libSlides: HeroSlide[] = librarySeries.slice(0, HERO_HALF).map(s => ({
       id:           s.manga_id,
       title:        s.manga_title,
-      coverUrl:     s.cover_url,
+      coverUrl:     proxiedCoverUrl(s.cover_url),
       description:  '',
       href:         seriesHref(s.manga_id),
       badge:        '✓ In Hebrew',

@@ -93,7 +93,9 @@ function getMDTitle(m: MDManga): string {
 function getMDCoverUrl(m: MDManga): string | null {
   const rel = m.relationships.find(r => r.type === 'cover_art')
   if (!rel?.attributes?.fileName) return null
-  return `https://uploads.mangadex.org/covers/${m.id}/${rel.attributes.fileName}.512.jpg`
+  // Routed through our server-side proxy — uploads.mangadex.org's hotlink
+  // protection blocks direct <img> requests whose Referer isn't mangadex.org.
+  return `/api/mangadex-cdn/covers/${m.id}/${rel.attributes.fileName}.512.jpg`
 }
 
 function getMDAuthor(m: MDManga): string {
