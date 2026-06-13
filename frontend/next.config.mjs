@@ -1,3 +1,9 @@
+// Backend base URL used for the server-side rewrite fallback below. Falls
+// back to the local FastAPI dev server. In production this is the deployed
+// backend's HTTPS URL — same value as NEXT_PUBLIC_BACKEND_URL (set both on
+// the hosting platform).
+const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:8000'
+
 /** @type {import('next').NextConfig} */
 const nextConfig = {
   // Allow the Next.js dev server to serve requests that originate from other
@@ -26,7 +32,7 @@ const nextConfig = {
       fallback: [
         {
           source: '/api/:path*',
-          destination: 'http://localhost:8000/api/:path*',
+          destination: `${BACKEND_URL}/api/:path*`,
         },
       ],
     }
