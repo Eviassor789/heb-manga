@@ -27,6 +27,7 @@ Prerequisites (must be done first — one-time)
 
 from __future__ import annotations
 
+import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -135,6 +136,34 @@ def download_lama() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Step 3: EasyOCR language packs  (local OCR fallback)
+# ---------------------------------------------------------------------------
+
+def download_easyocr() -> None:
+    """
+    Pre-download EasyOCR's English detection/recognition weights.
+
+    In production, OCR runs on Gemini Vision; EasyOCR is only the offline
+    fallback. EasyOCR downloads its packs on the first Reader() call, which
+    would otherwise happen mid-request on a cold server. Warming it here moves
+    that one-time ~80 MB download into the build/boot step instead.
+    """
+    print("\n[3/3] EasyOCR English language packs")
+    try:
+        import easyocr  # noqa: PLC0415
+    except ImportError:
+        print("  easyocr is not installed. Run: pip install easyocr")
+        return
+    try:
+        # Instantiating the Reader triggers the model download + cache.
+        easyocr.Reader(["en"], gpu=False)
+        print("  EasyOCR English packs are ready.")
+        print("  [3/3] Done.")
+    except Exception as exc:
+        print(f"  EasyOCR warm-up failed (non-fatal): {exc}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 
@@ -143,9 +172,20 @@ if __name__ == "__main__":
     print(" Hebrew Manga Translator — First-Run Model Setup")
     print("=" * 55)
 
-    _check_vendor()
-    download_detector()
-    download_lama()
+    # Production servers offload detection + inpainting to Modal GPU (BYOK), so
+    # the only model they need locally is EasyOCR. Set MODELS_EASYOCR_ONLY=1
+    # (or pass --easyocr-only) to skip the unused detector + LaMa downloads.
+    easyocr_only = (
+        os.getenv("MODELS_EASYOCR_ONLY", "").lower() in {"1", "true", "yes"}
+        or "--easyocr-only" in sys.argv
+    )
+
+    if not easyocr_only:
+        _check_vendor()
+        download_detector()
+        download_lama()
+
+    download_easyocr()
 
     print("\nAll done. You can now start the backend:")
     print("  uvicorn main:app --reload --port 8000")

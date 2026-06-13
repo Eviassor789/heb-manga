@@ -1,0 +1,38 @@
+# Render.com blueprint for the FastAPI backend (Docker).
+# Render → New → Blueprint → point at this repo. Then fill in the env vars
+# marked `sync: false` in the dashboard (they are secrets, not committed here).
+#
+# Why Render (or Railway / Fly.io) and NOT Vercel for the backend:
+#   The backend runs long (multi-minute) pipelines, holds open SSE connections,
+#   runs background asyncio tasks (the janitor), and keeps job state in process
+#   memory. Vercel's serverless functions kill background work, cap execution
+#   time, and don't hold streaming connections — so the backend needs a real
+#   always-on container host. The Next.js FRONTEND still goes on Vercel.
+services:
+  - type: web
+    name: hmt-backend
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend
+    plan: free               # sleeps on idle + 512MB RAM (cold starts ~30-60s); bump to "starter" if you hit OOM
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: ALLOWED_ORIGINS         # https://your-app.vercel.app
+        sync: false
+      - key: MAX_CONCURRENT_JOBS
+        value: "2"
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_KEY
+        sync: false
+      - key: R2_BUCKET
+        sync: false
+      - key: R2_PUBLIC_URL
+        sync: false

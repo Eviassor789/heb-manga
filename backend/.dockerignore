@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Secrets — never bake into the image; inject via the platform's env/secrets
+.env
+*.env.local
+
+# Runtime data + large model weights (generated/downloaded, not shipped)
+data/
+models/
+vendor/
+
+# Local tooling
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.log

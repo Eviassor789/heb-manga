@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
@@ -25,14 +25,26 @@ from pipeline import detector, inpainter, ocr, splitter, translator, typesetter
 from core.job_manager import JobManager
 from core.manga_downloader import download_chapter, extract_chapter_id
 from core.pdf_utils import build_compressed_pdf
+from core.cache import TTLCache
+from core.ratelimit import RateLimiter, client_ip
 from core import library
 
 app = FastAPI(title="Hebrew Manga Translator API", version="0.1.0")
 
+# ── CORS ────────────────────────────────────────────────────────────────────
+# Lock origins down in production via ALLOWED_ORIGINS (comma-separated list of
+# exact origins, e.g. "https://my-app.vercel.app,https://www.my-app.com").
+# Defaults to "*" for local dev. We never use cookies/sessions (auth is via
+# X-* headers / body keys), so allow_credentials stays False — which also keeps
+# a wildcard origin valid per the CORS spec.
+_ALLOWED_ORIGINS = [
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
+] or ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # tightened per-origin in production via env var if needed
-    allow_credentials=True,
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],          # includes X-Gemini-Api-Key, X-Modal-Token-Id/Secret
 )
@@ -45,13 +57,80 @@ ALLOWED_EXTENSIONS = {".pdf", ".zip"}
 
 job_manager = JobManager()
 
-# True when the server itself is configured to use Modal (no per-user tokens needed).
-_SERVER_USES_MODAL = os.getenv("USE_MODAL", "false").lower() == "true"
+# ── GPU policy ───────────────────────────────────────────────────────────────
+# Detection + inpainting ALWAYS run on Modal GPU, paid for by each user's own
+# Modal tokens (BYOK). There is intentionally no server-side "use local GPU"
+# escape hatch: the production host is small and cannot run these models, so
+# every job MUST supply Modal tokens (enforced in _require_api_keys below).
 
-# Periodic janitor — sweeps data/jobs/ for abandoned/incomplete jobs while the
-# server stays up for long stretches (production: no restart-triggered scan).
+# ── Concurrency control ──────────────────────────────────────────────────────
+# Cap how many pipelines run their heavy stages at once. Even though detection/
+# inpainting are offloaded to Modal, each job still does local work (page
+# downloads, PDF assembly, the EasyOCR fallback) — so unbounded concurrency
+# would exhaust the small host. Extra jobs are accepted and queue for a slot.
+_MAX_CONCURRENT_JOBS = max(1, int(os.getenv("MAX_CONCURRENT_JOBS", "2")))
+_pipeline_sem = asyncio.Semaphore(_MAX_CONCURRENT_JOBS)
+
+# One active translation per client IP. Maps client IP -> job_id. Prevents a
+# single visitor from queuing dozens of jobs and starving everyone else.
+_active_job_ips: dict[str, str] = {}
+
+# ── Periodic janitor ─────────────────────────────────────────────────────────
+# Sweeps data/jobs/ for abandoned/incomplete jobs while the server stays up for
+# long stretches (production: no restart-triggered scan).
 _JANITOR_INTERVAL_SECONDS = int(os.getenv("JANITOR_INTERVAL_SECONDS", str(3 * 60 * 60)))  # every 3 h
 _JANITOR_GRACE_SECONDS    = int(os.getenv("JANITOR_GRACE_SECONDS", str(60 * 60)))          # 60 min idle
+
+# ── Caching + rate limiting (public, no-auth endpoints) ──────────────────────
+_cache = TTLCache()
+# Tight limit for endpoints that scrape WeebCentral (protects our IP from being
+# throttled/blocked upstream); roomier limit for cheap local DB reads.
+_scrape_rl = RateLimiter(calls=int(os.getenv("SCRAPE_RATE_PER_MIN", "30")), window=60)
+_api_rl    = RateLimiter(calls=int(os.getenv("API_RATE_PER_MIN", "120")),  window=60)
+
+
+# ---------------------------------------------------------------------------
+# Per-IP active-job reservation helpers
+# ---------------------------------------------------------------------------
+
+def _reserve_ip_slot(ip: str, job_id: str) -> None:
+    """
+    Claim the single active-job slot for this client IP, or reject with 429 if
+    the IP already has a translation in progress. Released by _release_ip_slot
+    in the pipeline runner's finally block (and reset automatically on restart
+    since the map lives in process memory).
+    """
+    if ip in _active_job_ips:
+        raise HTTPException(
+            status_code=429,
+            detail="You already have a translation in progress. "
+                   "Please wait for it to finish before starting another.",
+        )
+    _active_job_ips[ip] = job_id
+
+
+def _release_ip_slot(job_id: str) -> None:
+    """Free whichever IP slot is holding this job_id (no-op if already gone)."""
+    for ip, jid in list(_active_job_ips.items()):
+        if jid == job_id:
+            _active_job_ips.pop(ip, None)
+
+
+# ---------------------------------------------------------------------------
+# Health check (used by the hosting platform's uptime probe)
+# ---------------------------------------------------------------------------
+
+@app.get("/health")
+@app.get("/healthz")
+async def health() -> dict:
+    """Liveness probe — returns current capacity + library mode."""
+    return {
+        "status":        "ok",
+        "active_jobs":   len(_active_job_ips),
+        "max_concurrent": _MAX_CONCURRENT_JOBS,
+        "library_mode":  "cloud" if library._supabase_mode() else
+                         ("hybrid" if library._r2_mode() else "local"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -296,8 +375,9 @@ def _save_job_config(
 
 def _require_api_keys(request: Request, body: "FetchChapterBody | None" = None) -> None:
     """
-    Hard gate: every job creation must supply a Gemini API key.
-    Modal GPU tokens are also required unless the server has USE_MODAL=true.
+    Hard gate: every job creation must supply BOTH a Gemini API key AND Modal
+    GPU tokens (BYOK). Detection/inpainting always run on the user's own Modal
+    GPU — there is no server-side fallback — so the tokens are non-negotiable.
 
     Checks body fields first (JSON body), then X-* headers as fallback.
     Raises HTTPException 422 if any required credential is absent.
@@ -311,20 +391,20 @@ def _require_api_keys(request: Request, body: "FetchChapterBody | None" = None) 
             status_code=422,
             detail="A Gemini API key is required. Add it in Settings.",
         )
-    if not _SERVER_USES_MODAL:
-        modal_id = (
-            (getattr(body, "modal_token_id", None) or "").strip()
-            or (request.headers.get("X-Modal-Token-Id") or "").strip()
+
+    modal_id = (
+        (getattr(body, "modal_token_id", None) or "").strip()
+        or (request.headers.get("X-Modal-Token-Id") or "").strip()
+    )
+    modal_sec = (
+        (getattr(body, "modal_token_secret", None) or "").strip()
+        or (request.headers.get("X-Modal-Token-Secret") or "").strip()
+    )
+    if not (modal_id and modal_sec):
+        raise HTTPException(
+            status_code=422,
+            detail="Modal GPU tokens (Token ID + Token Secret) are required. Add them in Settings.",
         )
-        modal_sec = (
-            (getattr(body, "modal_token_secret", None) or "").strip()
-            or (request.headers.get("X-Modal-Token-Secret") or "").strip()
-        )
-        if not (modal_id and modal_sec):
-            raise HTTPException(
-                status_code=422,
-                detail="Modal GPU tokens (Token ID + Token Secret) are required. Add them in Settings.",
-            )
 
 
 # ---------------------------------------------------------------------------
@@ -381,6 +461,9 @@ async def create_job(
     upload_path = job_dir / f"source{suffix}"
     upload_path.write_bytes(content)
 
+    # Enforce one active translation per IP, then hand off to the background
+    # runner (which releases the slot when the job ends, succeed or fail).
+    _reserve_ip_slot(client_ip(request), job_id)
     job_manager.register_job(job_id)
     asyncio.create_task(_run_pipeline(job_id, upload_path))
 
@@ -421,6 +504,7 @@ async def create_job_from_url(request: Request, body: FetchChapterBody):
         modal_token_secret=body.modal_token_secret,
     )
 
+    _reserve_ip_slot(client_ip(request), job_id)
     job_manager.register_job(job_id)
     asyncio.create_task(
         _run_pipeline_from_url(job_id, job_dir, body.url, body.data_saver)
@@ -502,7 +586,7 @@ async def delete_job(job_id: str):
 
 
 @app.post("/api/jobs/{job_id}/resume", status_code=202)
-async def resume_job(job_id: str, body: ResumeBody):
+async def resume_job(job_id: str, body: ResumeBody, request: Request):
     """
     Re-run the pipeline from a given step using already-computed artifacts.
 
@@ -531,6 +615,9 @@ async def resume_job(job_id: str, body: ResumeBody):
             detail="No pages found in original/. "
                    "Run a full job first before resuming.",
         )
+
+    # Hold the same one-job-per-IP slot for the resumed run.
+    _reserve_ip_slot(client_ip(request), job_id)
 
     # Salvage chapter title before history is cleared
     title_file = job_dir / "chapter_title.txt"
@@ -701,10 +788,14 @@ async def _run_pipeline(job_id: str, source_file: Path) -> None:
     job_dir = _job_dir(job_id)
 
     try:
-        # ── Step 0: Split ──────────────────────────────────────────────────
-        pages = await splitter.split(job_dir, source_file, emit)
+        # Gate heavy work behind the global concurrency cap. The job was already
+        # accepted (201) so the SSE stream is connected; it simply waits here
+        # until a slot frees up.
+        async with _pipeline_sem:
+            # ── Step 0: Split ──────────────────────────────────────────────
+            pages = await splitter.split(job_dir, source_file, emit)
 
-        await _run_pipeline_steps(job_id, job_dir, pages, emit)
+            await _run_pipeline_steps(job_id, job_dir, pages, emit)
 
         # ── Cleanup: remove intermediate dirs to save disk space ──────────
         asyncio.create_task(_cleanup_intermediates(job_dir))
@@ -716,6 +807,8 @@ async def _run_pipeline(job_id: str, source_file: Path) -> None:
             shutil.rmtree(job_dir, ignore_errors=True)
         except Exception:
             pass
+    finally:
+        _release_ip_slot(job_id)
 
 
 async def _run_pipeline_from_url(
@@ -728,19 +821,23 @@ async def _run_pipeline_from_url(
     emit = job_manager.get_emitter(job_id)
 
     try:
-        # ── Step 0: Download ───────────────────────────────────────────────
-        pages = await download_chapter(url, job_dir, emit, data_saver=data_saver)
+        # Gate heavy work behind the global concurrency cap (see _run_pipeline).
+        async with _pipeline_sem:
+            # ── Step 0: Download ───────────────────────────────────────────
+            pages = await download_chapter(url, job_dir, emit, data_saver=data_saver)
 
-        await _run_pipeline_steps(job_id, job_dir, pages, emit)
+            await _run_pipeline_steps(job_id, job_dir, pages, emit)
 
-        # ── Cleanup: remove intermediate dirs to save disk space ──────────
-        asyncio.create_task(_cleanup_intermediates(job_dir))
+            # ── Cleanup: remove intermediate dirs to save disk space ──────
+            asyncio.create_task(_cleanup_intermediates(job_dir))
 
         # ── Library: build compressed PDF + register chapter ──────────────
-        # "done" was already emitted inside _run_pipeline_steps, so awaiting
-        # registration here doesn't block the user from getting their link.
-        # We await (rather than create_task) so the write commits before the
-        # coroutine returns — a server restart no longer loses the entry.
+        # Done outside the semaphore so the R2 upload doesn't hold a slot that
+        # another queued job could use. "done" was already emitted inside
+        # _run_pipeline_steps, so awaiting registration here doesn't block the
+        # user from getting their link. We await (rather than create_task) so
+        # the write commits before the coroutine returns — a server restart no
+        # longer loses the entry.
         await _register_in_library(job_dir, emit=emit)
 
     except Exception as exc:
@@ -750,6 +847,8 @@ async def _run_pipeline_from_url(
             shutil.rmtree(job_dir, ignore_errors=True)
         except Exception:
             pass
+    finally:
+        _release_ip_slot(job_id)
 
 
 # ---------------------------------------------------------------------------
@@ -880,17 +979,25 @@ def _parse_wc_series(html_text: str, *, limit: int = 30) -> list[dict]:
     return out
 
 
-@app.get("/api/search/weebcentral")
+@app.get("/api/search/weebcentral", dependencies=[Depends(_scrape_rl)])
 async def search_weebcentral(q: str = ""):
     """
     Proxy WeebCentral search (GET /search/data) → JSON list of manga series.
-    We proxy it server-side to avoid CORS.
+    We proxy it server-side to avoid CORS. Results are cached per query for a
+    couple of minutes so repeated searches don't hammer WeebCentral.
 
     Returns: { results: [{ id, title, cover, url }] }
     """
-    if not q.strip():
+    q_norm = q.strip()
+    if not q_norm:
         return {"results": []}
+    return await _cache.get_or_set(
+        f"wc:search:{q_norm.lower()}", 120, lambda: _search_weebcentral_fetch(q_norm)
+    )
 
+
+async def _search_weebcentral_fetch(q: str) -> dict:
+    """Uncached WeebCentral search fetch — wrapped by search_weebcentral()."""
     import httpx
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
@@ -925,7 +1032,7 @@ async def search_weebcentral(q: str = ""):
     return {"results": _parse_wc_series(res.text)}
 
 
-@app.get("/api/weebcentral/featured")
+@app.get("/api/weebcentral/featured", dependencies=[Depends(_scrape_rl)])
 async def weebcentral_featured():
     """
     Return the latest-updated series from WeebCentral for the discover page.
@@ -940,8 +1047,16 @@ async def weebcentral_featured():
     filtered to included_tag=Adventure and interleave it with the general
     "Latest Updates" pool (deduplicated, capped at 24 total).
 
+    The merged result is cached for a few minutes (it's the same for everyone)
+    so the home/discover page doesn't re-scrape WeebCentral on every visit.
+
     Returns: { results: [{ id, title, cover, url }] }
     """
+    return await _cache.get_or_set("wc:featured", 300, _weebcentral_featured_fetch)
+
+
+async def _weebcentral_featured_fetch() -> dict:
+    """Uncached featured fetch — wrapped by weebcentral_featured()."""
     import httpx
 
     _EXCLUDED_TAGS = ["Harem", "Hentai", "Ecchi", "Mature", "Romance"]
@@ -1010,12 +1125,20 @@ async def weebcentral_featured():
     return {"results": merged}
 
 
-@app.get("/api/weebcentral/series/{series_id}")
+@app.get("/api/weebcentral/series/{series_id}", dependencies=[Depends(_scrape_rl)])
 async def weebcentral_series_info(series_id: str):
     """
-    Return title, cover and description for a WeebCentral series by scraping its page.
+    Return title, cover and description for a WeebCentral series by scraping its
+    page. Cached per series for ~10 min (series metadata changes rarely).
     Returns: { id, title, cover, description, url }
     """
+    return await _cache.get_or_set(
+        f"wc:series:{series_id}", 600, lambda: _weebcentral_series_info_fetch(series_id)
+    )
+
+
+async def _weebcentral_series_info_fetch(series_id: str) -> dict:
+    """Uncached series-info scrape — wrapped by weebcentral_series_info()."""
     import httpx
     from bs4 import BeautifulSoup
 
@@ -1122,15 +1245,24 @@ def _clean_chapter_label(link_tag) -> str:
     return " ".join(parts).strip()
 
 
-@app.get("/api/weebcentral/series/{series_id}/chapters")
+@app.get("/api/weebcentral/series/{series_id}/chapters", dependencies=[Depends(_scrape_rl)])
 async def weebcentral_series_chapters(series_id: str):
     """
     Return the FULL chapter list for a WeebCentral series using the
     /full-chapter-list endpoint (shows all chapters without needing "show all").
+    Cached per series for ~10 min so the series page doesn't re-scrape on every
+    load / filter toggle.
 
     Returns: { chapters: [{ id, number, title, url }] }
     Chapters are returned newest-first (WeebCentral's natural order).
     """
+    return await _cache.get_or_set(
+        f"wc:chapters:{series_id}", 600, lambda: _weebcentral_series_chapters_fetch(series_id)
+    )
+
+
+async def _weebcentral_series_chapters_fetch(series_id: str) -> dict:
+    """Uncached chapter-list scrape — wrapped by weebcentral_series_chapters()."""
     import httpx
     from bs4 import BeautifulSoup
 
@@ -1204,7 +1336,7 @@ async def weebcentral_series_chapters(series_id: str):
 # Library API
 # ---------------------------------------------------------------------------
 
-@app.get("/api/library")
+@app.get("/api/library", dependencies=[Depends(_api_rl)])
 async def get_library():
     """
     Return all completed chapters in the shared library, newest first.
@@ -1492,7 +1624,7 @@ async def _fetch_chapter_meta_for_id(client, mangadex_id: str) -> dict:
     }
 
 
-@app.get("/api/library/manga/{mangadex_manga_id}")
+@app.get("/api/library/manga/{mangadex_manga_id}", dependencies=[Depends(_api_rl)])
 async def get_library_by_manga(mangadex_manga_id: str):
     """
     Return all translated chapters for a specific manga UUID.
@@ -1504,7 +1636,7 @@ async def get_library_by_manga(mangadex_manga_id: str):
     return {"chapters": chapters}
 
 
-@app.get("/api/library/{chapter_id}")
+@app.get("/api/library/{chapter_id}", dependencies=[Depends(_api_rl)])
 async def get_library_chapter(chapter_id: str):
     """
     Return a single chapter's metadata (including pdf_url and pages_prefix).
@@ -1563,27 +1695,42 @@ async def _run_pipeline_from_step(
     _steps = ["detect", "ocr", "inpaint", "translate", "typeset"]
     start  = _steps.index(from_step)
 
+    # Recover the per-job Modal tokens so detect/inpaint run on the user's GPU
+    # (same BYOK policy as a fresh job — there is no local-GPU fallback).
+    cfg_path = job_dir / "job_config.json"
+    job_cfg  = json.loads(cfg_path.read_text(encoding="utf-8")) if cfg_path.exists() else {}
+    modal_token_id:     str | None = job_cfg.get("modal_token_id")     or None
+    modal_token_secret: str | None = job_cfg.get("modal_token_secret") or None
+
     try:
-        if start <= 0:
-            pages = await detector.detect(job_dir, pages, emit)
-        if start <= 1:
-            pages = await ocr.ocr(job_dir, pages, emit)
-        if start <= 2:
-            pages = await inpainter.inpaint(job_dir, pages, emit)
-        if start <= 3:
-            pages = await translator.translate(job_dir, pages, emit)
-        if start <= 4:
-            pages = await typesetter.typeset(job_dir, pages, emit)
+        # Gate heavy work behind the global concurrency cap (see _run_pipeline).
+        async with _pipeline_sem:
+            if start <= 0:
+                pages = await detector.detect(
+                    job_dir, pages, emit, modal_token_id, modal_token_secret
+                )
+            if start <= 1:
+                pages = await ocr.ocr(job_dir, pages, emit)
+            if start <= 2:
+                pages = await inpainter.inpaint(
+                    job_dir, pages, emit, modal_token_id, modal_token_secret
+                )
+            if start <= 3:
+                pages = await translator.translate(job_dir, pages, emit)
+            if start <= 4:
+                pages = await typesetter.typeset(job_dir, pages, emit)
 
-        await emit({
-            "stage":        "done",
-            "total_pages":  len(pages),
-            "download_url": f"/api/jobs/{job_id}/download",
-        })
+            await emit({
+                "stage":        "done",
+                "total_pages":  len(pages),
+                "download_url": f"/api/jobs/{job_id}/download",
+            })
 
-        # Clean up intermediate artifacts and register in library —
-        # same as the full URL pipeline so resumed jobs are also indexed.
-        asyncio.create_task(_cleanup_intermediates(job_dir))
+            # Clean up intermediate artifacts (register in library below).
+            asyncio.create_task(_cleanup_intermediates(job_dir))
+
+        # Register outside the semaphore — same as the URL pipeline so resumed
+        # jobs are also indexed without holding a concurrency slot during upload.
         await _register_in_library(job_dir, emit=emit)
 
     except Exception as exc:
@@ -1593,3 +1740,5 @@ async def _run_pipeline_from_step(
             shutil.rmtree(job_dir, ignore_errors=True)
         except Exception:
             pass
+    finally:
+        _release_ip_slot(job_id)
