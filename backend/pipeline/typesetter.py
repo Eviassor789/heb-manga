@@ -17,11 +17,12 @@ Font
 Priority order:
   1. HEBREW_FONT_PATH environment variable (absolute path to a .ttf/.otf)
   2. Any .ttf / .otf file found in backend/fonts/ — by default this is
-     FrankRuhlLibre-Variable.ttf (bundled + committed, OFL license), a
-     classic Hebrew serif. Loaded at its "Bold" named instance.
+     DavidLibre-Bold.ttf (bundled + committed, OFL license), the open-source
+     release of the classic "David" Hebrew serif (the same family as the
+     Windows-only davidbd.ttf this replaced).
   3. OS system fonts that support Hebrew
-  4. Auto-download the Frank Ruhl Libre variable font from Google Fonts into
-     backend/fonts/ (only reached if backend/fonts/ is empty)
+  4. Auto-download DavidLibre-Bold.ttf from Google Fonts into backend/fonts/
+     (only reached if backend/fonts/ is empty)
 
 Bundling the font in backend/fonts/ (rather than relying on step 3/4) keeps
 rendering identical across dev machines and the production container — step
@@ -72,20 +73,22 @@ _PADDING       = 8     # pixels between text block and bbox edges
 _TEXT_COLOR   = (0, 0, 0)          # solid black fill
 _STROKE_COLOR = (255, 255, 255)    # white outline — keeps text legible on any bg
 
-# Frank Ruhl Libre: classic Hebrew serif, OFL license. Only ships as a
-# variable font (weight axis 300-900) — _load_font() selects the "Bold"
-# named instance at load time.
-_FONT_FILENAME = "FrankRuhlLibre-Variable.ttf"
+# David Libre Bold: open-source release of the classic "David" Hebrew serif,
+# OFL license. Static font (no variation axes) — _load_font()'s variation
+# selection below is a no-op for this font but kept for any future variable
+# font dropped into backend/fonts/.
+_FONT_FILENAME = "DavidLibre-Bold.ttf"
 
-# Named instance to select from the variable font, in preference order.
+# Named instance to select if the resolved font is a variable font, in
+# preference order (no-op for static fonts like the bundled David Libre).
 _FONT_VARIATION_PREFERENCE = (b"Bold", b"SemiBold", b"Medium")
 
 # Multiple CDN mirrors tried in order — first success wins
 _FONT_DOWNLOAD_URLS = [
     # raw.githubusercontent (most reliable for large files)
-    "https://raw.githubusercontent.com/google/fonts/main/ofl/frankruhllibre/FrankRuhlLibre%5Bwght%5D.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/davidlibre/DavidLibre-Bold.ttf",
     # github.com/raw redirect (sometimes works when above doesn't)
-    "https://github.com/google/fonts/raw/main/ofl/frankruhllibre/FrankRuhlLibre%5Bwght%5D.ttf",
+    "https://github.com/google/fonts/raw/main/ofl/davidlibre/DavidLibre-Bold.ttf",
 ]
 
 # OS system fonts that support Hebrew — checked before attempting any download.
@@ -127,9 +130,9 @@ def _resolve_font() -> Path:
 
     Search order:
       1. HEBREW_FONT_PATH environment variable
-      2. Any .ttf/.otf in backend/fonts/ (bundled: FrankRuhlLibre-Variable.ttf)
+      2. Any .ttf/.otf in backend/fonts/ (bundled: DavidLibre-Bold.ttf)
       3. OS system fonts that support Hebrew  (Windows David/Arial, Linux Noto/DejaVu, macOS Arial)
-      4. Auto-download the Frank Ruhl Libre variable font — tries multiple CDN mirrors in sequence
+      4. Auto-download DavidLibre-Bold.ttf — tries multiple CDN mirrors in sequence
 
     Raises RuntimeError if every option fails.
     """
