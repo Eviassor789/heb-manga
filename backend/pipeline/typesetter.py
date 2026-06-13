@@ -16,8 +16,17 @@ Font
 ────
 Priority order:
   1. HEBREW_FONT_PATH environment variable (absolute path to a .ttf/.otf)
-  2. Any .ttf / .otf file found in backend/fonts/
-  3. Auto-download Heebo-Bold.ttf from Google Fonts into backend/fonts/
+  2. Any .ttf / .otf file found in backend/fonts/ — by default this is
+     FrankRuhlLibre-Variable.ttf (bundled + committed, OFL license), a
+     classic Hebrew serif. Loaded at its "Bold" named instance.
+  3. OS system fonts that support Hebrew
+  4. Auto-download the Frank Ruhl Libre variable font from Google Fonts into
+     backend/fonts/ (only reached if backend/fonts/ is empty)
+
+Bundling the font in backend/fonts/ (rather than relying on step 3/4) keeps
+rendering identical across dev machines and the production container — step
+3 in particular depends on which OS fonts happen to be installed, which
+differs between Windows dev and the Linux deploy container.
 
 RTL rendering note
 ──────────────────
@@ -63,17 +72,20 @@ _PADDING       = 8     # pixels between text block and bbox edges
 _TEXT_COLOR   = (0, 0, 0)          # solid black fill
 _STROKE_COLOR = (255, 255, 255)    # white outline — keeps text legible on any bg
 
-# Heebo Bold: clean, legible at small sizes, OFL license
-_FONT_FILENAME = "Heebo-Bold.ttf"
+# Frank Ruhl Libre: classic Hebrew serif, OFL license. Only ships as a
+# variable font (weight axis 300-900) — _load_font() selects the "Bold"
+# named instance at load time.
+_FONT_FILENAME = "FrankRuhlLibre-Variable.ttf"
+
+# Named instance to select from the variable font, in preference order.
+_FONT_VARIATION_PREFERENCE = (b"Bold", b"SemiBold", b"Medium")
 
 # Multiple CDN mirrors tried in order — first success wins
 _FONT_DOWNLOAD_URLS = [
     # raw.githubusercontent (most reliable for large files)
-    "https://raw.githubusercontent.com/google/fonts/main/ofl/heebo/static/Heebo-Bold.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/frankruhllibre/FrankRuhlLibre%5Bwght%5D.ttf",
     # github.com/raw redirect (sometimes works when above doesn't)
-    "https://github.com/google/fonts/raw/main/ofl/heebo/static/Heebo-Bold.ttf",
-    # Variable font — Pillow handles it fine, just picks weight 400
-    "https://raw.githubusercontent.com/google/fonts/main/ofl/heebo/Heebo%5Bwght%5D.ttf",
+    "https://github.com/google/fonts/raw/main/ofl/frankruhllibre/FrankRuhlLibre%5Bwght%5D.ttf",
 ]
 
 # OS system fonts that support Hebrew — checked before attempting any download.
@@ -115,9 +127,9 @@ def _resolve_font() -> Path:
 
     Search order:
       1. HEBREW_FONT_PATH environment variable
-      2. Any .ttf/.otf in backend/fonts/
+      2. Any .ttf/.otf in backend/fonts/ (bundled: FrankRuhlLibre-Variable.ttf)
       3. OS system fonts that support Hebrew  (Windows David/Arial, Linux Noto/DejaVu, macOS Arial)
-      4. Auto-download Heebo-Bold.ttf — tries multiple CDN mirrors in sequence
+      4. Auto-download the Frank Ruhl Libre variable font — tries multiple CDN mirrors in sequence
 
     Raises RuntimeError if every option fails.
     """
@@ -174,13 +186,25 @@ def _resolve_font() -> Path:
     raise RuntimeError(
         f"No Hebrew font available and all auto-download attempts failed "
         f"(last error: {last_exc}).\n"
-        f"  Fix: download any Hebrew TTF (e.g. Heebo-Bold.ttf) and place it in:\n"
+        f"  Fix: download any Hebrew TTF (e.g. FrankRuhlLibre-Variable.ttf) and place it in:\n"
         f"       {_FONTS_DIR}"
     ) from last_exc
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
-    return ImageFont.truetype(str(_resolve_font()), size)
+    font = ImageFont.truetype(str(_resolve_font()), size)
+    # If this is a variable font (e.g. the bundled Frank Ruhl Libre), select
+    # a bold-ish named instance — the default instance is Regular (400),
+    # which renders thinner than the David/Heebo bold fonts this replaced.
+    try:
+        available = font.get_variation_names()
+    except Exception:
+        return font  # static font — no variation axes
+    for preferred in _FONT_VARIATION_PREFERENCE:
+        if preferred in available:
+            font.set_variation_by_name(preferred)
+            break
+    return font
 
 
 # ---------------------------------------------------------------------------
