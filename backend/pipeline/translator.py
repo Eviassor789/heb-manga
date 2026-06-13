@@ -1,19 +1,20 @@
 """
 Step 4 — Context-Aware Translation (Gemini API)
 
-For each page:
-  1. Load the detection JSON — source_text is now filled by Step 2 (OCR)
+For each batch of TRANSLATION_PAGES_PER_REQUEST consecutive pages (default 5):
+  1. Load each page's detection JSON — source_text is now filled by Step 2 (OCR)
   2. Collect every dialogue / narration region that has source_text
-  3. Send the whole page as a single batched Gemini request (minimises RPM usage)
+  3. Send all of those pages' regions as a single batched Gemini request
+     (minimises RPM usage and gives Gemini more cross-page context)
   4. Gemini returns translated Hebrew text + any new glossary entries it noticed
-  5. Write hebrew_text back into the detection JSON
-  6. Merge glossary updates into <job_dir>/glossary.json for the next page
+  5. Write hebrew_text back into each page's detection JSON
+  6. Merge glossary updates into <job_dir>/glossary.json for the next batch
 
 Glossary system
 ───────────────
 glossary.json starts empty and grows as Gemini identifies proper nouns
 (character names, place names, titles). It is prepended to every subsequent
-page's user message so translations stay consistent across the whole file.
+batch's user message so translations stay consistent across the whole file.
 
 Free-tier limits: 15 RPM · 1 M TPM · 1 500 RPD
 Rate limiting is handled by core/rate_limiter.py (exponential backoff).
@@ -64,8 +65,20 @@ class _GeminiResponse(_GeminiResponseRequired, total=False):
 _DEFAULT_MODEL = "gemini-2.5-flash"
 _TEMPERATURE   = 0.1   # very low = deterministic, minimises hallucination / omission
 
-# How many pages to translate in parallel.
-# Free tier  → keep at 1 (15 RPM shared across all pages)
+# How many consecutive pages' regions to send to Gemini in a single request.
+# Cuts total API calls roughly N-fold (helps a lot on the free tier's 15 RPM
+# limit) and gives Gemini more cross-page context for consistent character
+# voice / gender / glossary use. Lower this if a very text-dense chapter ever
+# produces truncated/invalid JSON.
+_PAGES_PER_REQUEST = max(1, int(os.getenv("TRANSLATION_PAGES_PER_REQUEST", "5")))
+
+# Cap on Gemini's response size. Larger batches → larger JSON responses;
+# Gemini 2.5 Flash supports up to 65536 output tokens, so set the cap high
+# enough that a full batch can never be truncated mid-JSON.
+_MAX_OUTPUT_TOKENS = int(os.getenv("TRANSLATION_MAX_OUTPUT_TOKENS", "65536"))
+
+# How many batches to translate in parallel.
+# Free tier  → keep at 1 (15 RPM shared across all batches)
 # Paid tier  → set TRANSLATION_CONCURRENCY=5 (or higher) in .env for a big speedup
 _CONCURRENCY = max(1, int(os.getenv("TRANSLATION_CONCURRENCY", "1")))
 
@@ -144,15 +157,18 @@ Translation rules
 6. Exclamations and short outbursts (e.g. "STOP!", "No!") must feel punchy in
    Hebrew — short, sharp, colloquial.
 
-7. The regions you receive are all from the same manga page. Use every region
-   as context for the scene, emotion, and who is speaking when you translate
-   each individual bubble.
+7. The regions you receive are in reading order from one or more consecutive
+   pages of the same manga chapter. Use every region as context for the
+   scene, emotion, and who is speaking when you translate each individual
+   bubble — earlier regions may establish a character's identity, gender, or
+   tone that carries forward into later ones.
 
 8. GENDERED HEBREW — critical for correctness.
    Hebrew grammar is fully gendered. Use the correct gender for every pronoun,
    verb conjugation, and adjective.  Infer each character's gender from context
-   within this page (pronouns, names, how others address them) and apply it
-   consistently throughout your translations for this page.
+   within this batch (pronouns, names, how others address them) and apply it
+   consistently throughout your translations — including across pages within
+   this batch.
 
 9. Do not include any explanation, commentary, or markdown in your response.
 
@@ -268,7 +284,14 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
 
     Concurrency is controlled by TRANSLATION_CONCURRENCY env var (default 1).
     With a paid Gemini API key, setting it to 5 can cut translation time by ~5×.
-    The glossary is shared across concurrent tasks using an asyncio.Lock.
+
+    Pages are grouped into batches of TRANSLATION_PAGES_PER_REQUEST (default 5)
+    consecutive pages, and each batch is sent to Gemini as a single request —
+    this cuts the total number of API calls roughly N-fold (helps a lot on the
+    free tier's 15 RPM limit) and gives Gemini more cross-page context for
+    consistent character voice / gender / glossary use.
+
+    The glossary is shared across concurrent batches using an asyncio.Lock.
     """
     await emit({"stage": "translate", "status": "running"})
 
@@ -284,108 +307,138 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
     total           = len(pages)
     sem             = asyncio.Semaphore(_CONCURRENCY)
 
-    # Token accounting (accumulated across all pages + retries)
+    # Token accounting (accumulated across all batches + retries)
     tokens_lock  = asyncio.Lock()
     tok_input    = 0
     tok_output   = 0
     tok_think    = 0
 
-    async def _process_page(page_path: Path) -> None:
-        nonlocal completed, glossary, tok_input, tok_output, tok_think
+    async def _bump(n: int = 1) -> None:
+        nonlocal completed
+        async with completed_lock:
+            completed += n
+            await emit({"stage": "translate", "status": "running",
+                        "page": completed, "total": total})
+
+    # ── Pre-scan: load each page's detection JSON and collect the regions
+    #    that actually need translation. Pages with no detection file or no
+    #    translatable regions are marked done immediately and never enter a
+    #    Gemini call. ─────────────────────────────────────────────────────────
+    PageJob = tuple[Path, dict, list[dict]]   # (json_path, page_data, translatable_regions)
+    page_jobs: list[PageJob] = []
+
+    for page_path in pages:
+        json_path = detection_dir / f"{page_path.stem}.json"
+
+        if not json_path.exists():
+            await _bump()
+            continue
+
+        page_data    = json.loads(json_path.read_text(encoding="utf-8"))
+        translatable = _get_translatable(page_data["regions"])
+
+        if not translatable:
+            await _bump()
+            continue
+
+        page_jobs.append((json_path, page_data, translatable))
+
+    # ── Group remaining pages into batches of _PAGES_PER_REQUEST ──────────────
+    batches: list[list[PageJob]] = [
+        page_jobs[i : i + _PAGES_PER_REQUEST]
+        for i in range(0, len(page_jobs), _PAGES_PER_REQUEST)
+    ]
+
+    async def _process_batch(batch: list[PageJob]) -> None:
+        nonlocal glossary, tok_input, tok_output, tok_think
 
         async with sem:                         # respect concurrency limit
-            json_path = detection_dir / f"{page_path.stem}.json"
-
-            if not json_path.exists():
-                async with completed_lock:
-                    completed += 1
-                    await emit({"stage": "translate", "status": "running",
-                                "page": completed, "total": total})
-                return
-
-            page_data    = json.loads(json_path.read_text(encoding="utf-8"))
-            translatable = _get_translatable(page_data["regions"])
-
-            if not translatable:
-                async with completed_lock:
-                    completed += 1
-                    await emit({"stage": "translate", "status": "running",
-                                "page": completed, "total": total})
-                return
+            # Build one combined payload across every page in this batch, with
+            # globally-unique ids (per-page region ids can collide). Each
+            # region dict is a reference into its page_data["regions"] list,
+            # so writing hebrew_text back into it mutates page_data in place.
+            payload: list[dict] = []
+            id_map:  dict[int, dict] = {}
+            gid = 0
+            for _json_path, _page_data, translatable in batch:
+                for region in translatable:
+                    payload.append({
+                        "id":          gid,
+                        "source_text": region["source_text"],
+                        "type":        region.get("type", "dialogue"),
+                    })
+                    id_map[gid] = region
+                    gid += 1
 
             # Snapshot glossary before the (potentially slow) API call
             async with glossary_lock:
                 glossary_snapshot = dict(glossary)
 
-            # Retry the entire page call on transient errors (network, API hiccup,
-            # bad response body).  We wait a few seconds between attempts so a
-            # brief service blip has time to recover.
+            # Retry the entire batch call on transient errors (network, API
+            # hiccup, bad response body). We wait a few seconds between
+            # attempts so a brief service blip has time to recover.
             translations: list[dict] = []
             glossary_updates: dict[str, str] = {}
-            page_tokens: dict[str, int] = {"input": 0, "output": 0, "think": 0}
-            page_succeeded = False
+            batch_tokens: dict[str, int] = {"input": 0, "output": 0, "think": 0}
+            batch_succeeded = False
+            page_names = ", ".join(jp.stem for jp, _, _ in batch)
 
-            for page_attempt in range(1, _MAX_PAGE_RETRIES + 2):  # +2 → 1 initial + N retries
+            for attempt in range(1, _MAX_BATCH_RETRIES + 2):  # +2 → 1 initial + N retries
                 try:
-                    translations, glossary_updates, page_tokens = \
-                        await _translate_page(translatable, glossary_snapshot,
-                                              user_api_key=user_api_key)
-                    page_succeeded = True
+                    translations, glossary_updates, batch_tokens = \
+                        await _translate_batch(payload, glossary_snapshot,
+                                               user_api_key=user_api_key)
+                    batch_succeeded = True
                     break
                 except Exception as exc:
-                    if page_attempt <= _MAX_PAGE_RETRIES:
-                        wait = min(10.0 * (2 ** (page_attempt - 1)), 120.0)
+                    if attempt <= _MAX_BATCH_RETRIES:
+                        wait = min(10.0 * (2 ** (attempt - 1)), 120.0)
                         log.warning(
-                            "[translator] Page %s failed (attempt %d/%d): %s — retry in %.0f s",
-                            page_path.name, page_attempt, _MAX_PAGE_RETRIES + 1, exc, wait,
+                            "[translator] Batch [%s] failed (attempt %d/%d): %s — retry in %.0f s",
+                            page_names, attempt, _MAX_BATCH_RETRIES + 1, exc, wait,
                         )
                         await asyncio.sleep(wait)
                     else:
                         log.error(
-                            "[translator] Page %s failed after %d attempts: %s — skipping.",
-                            page_path.name, _MAX_PAGE_RETRIES + 1, exc,
+                            "[translator] Batch [%s] failed after %d attempts: %s — skipping.",
+                            page_names, _MAX_BATCH_RETRIES + 1, exc,
                         )
 
-            if not page_succeeded:
-                async with completed_lock:
-                    completed += 1
-                    await emit({"stage": "translate", "status": "running",
-                                "page": completed, "total": total})
+            if not batch_succeeded:
+                await _bump(len(batch))
                 return
 
             # Accumulate token counts
             async with tokens_lock:
-                tok_input  += page_tokens.get("input",  0)
-                tok_output += page_tokens.get("output", 0)
-                tok_think  += page_tokens.get("think",  0)
+                tok_input  += batch_tokens.get("input",  0)
+                tok_output += batch_tokens.get("output", 0)
+                tok_think  += batch_tokens.get("think",  0)
 
             # Write hebrew_text back into the region objects
-            id_to_hebrew = {t["id"]: t["hebrew_text"] for t in translations}
-            for region in page_data["regions"]:
-                if region["id"] in id_to_hebrew:
-                    region["hebrew_text"] = id_to_hebrew[region["id"]]
+            for t in translations:
+                region = id_map.get(t["id"])
+                if region is not None:
+                    region["hebrew_text"] = t["hebrew_text"]
 
-            json_path.write_text(
-                json.dumps(page_data, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+            for json_path, page_data, _translatable in batch:
+                json_path.write_text(
+                    json.dumps(page_data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
 
-            # Merge glossary updates under the lock so concurrent tasks don't race
+            # Merge glossary updates under the lock so concurrent batches don't race
             if glossary_updates:
                 async with glossary_lock:
                     glossary.update(glossary_updates)
                     _save_glossary(job_dir, glossary)
 
             log.info(
-                "[translator] %s — translated %d region(s), %d new glossary term(s).",
-                page_path.name, len(translations), len(glossary_updates),
+                "[translator] pages [%s] — translated %d region(s), %d new glossary term(s).",
+                page_names, len(translations), len(glossary_updates),
             )
-            async with completed_lock:
-                completed += 1
-                await emit({"stage": "translate", "status": "running",
-                            "page": completed, "total": total})
+            await _bump(len(batch))
 
-    await asyncio.gather(*(_process_page(p) for p in pages))
+    await asyncio.gather(*(_process_batch(b) for b in batches))
 
     # ── Cost summary ──────────────────────────────────────────────────────────
     cost_usd = (
@@ -419,103 +472,7 @@ async def translate(job_dir: Path, pages: list[Path], emit: EmitFn) -> list[Path
 
 
 # ---------------------------------------------------------------------------
-# Public per-page entrypoint (used by the parallel pipeline in main.py)
-# ---------------------------------------------------------------------------
-
-async def translate_one_page(
-    page_path:     Path,
-    job_dir:       Path,
-    glossary:      dict[str, str],
-    glossary_lock: asyncio.Lock,
-    user_api_key:  str | None = None,
-) -> dict[str, int]:
-    """
-    Translate a single page in isolation.
-
-    Designed to be called concurrently from the pipelined orchestrator in main.py.
-    Updates the shared *glossary* dict in-place under *glossary_lock* so every
-    page that starts after this one benefits from newly discovered proper nouns.
-
-    Returns accumulated token counts {input, output, think}.
-    """
-    detection_dir = job_dir / "detection"
-    json_path     = detection_dir / f"{page_path.stem}.json"
-
-    if not json_path.exists():
-        return {"input": 0, "output": 0, "think": 0}
-
-    page_data    = json.loads(json_path.read_text(encoding="utf-8"))
-    translatable = _get_translatable(page_data["regions"])
-
-    if not translatable:
-        return {"input": 0, "output": 0, "think": 0}
-
-    # Skip pages that are already fully translated (e.g. when resuming after
-    # a partial failure — only re-translate pages with missing hebrew_text).
-    already_done = all(
-        (r.get("hebrew_text") or "").strip()
-        for r in translatable
-    )
-    if already_done:
-        log.debug("[translator] %s — already translated, skipping.", page_path.name)
-        return {"input": 0, "output": 0, "think": 0}
-
-    # Snapshot the glossary under lock so we capture every term added by
-    # pages that completed before us (serialised by translate_sem in main.py).
-    async with glossary_lock:
-        glossary_snapshot = dict(glossary)
-
-    translations:     list[dict]      = []
-    glossary_updates: dict[str, str]  = {}
-    page_tokens:      dict[str, int]  = {"input": 0, "output": 0, "think": 0}
-    page_succeeded = False
-
-    for attempt in range(1, _MAX_PAGE_RETRIES + 2):   # +2 → initial + N retries
-        try:
-            translations, glossary_updates, page_tokens = await _translate_page(
-                translatable, glossary_snapshot, user_api_key=user_api_key
-            )
-            page_succeeded = True
-            break
-        except Exception as exc:
-            if attempt <= _MAX_PAGE_RETRIES:
-                wait = min(10.0 * (2 ** (attempt - 1)), 120.0)
-                log.warning(
-                    "[translator] Page %s failed (attempt %d/%d): %s — retry in %.0f s",
-                    page_path.name, attempt, _MAX_PAGE_RETRIES + 1, exc, wait,
-                )
-                await asyncio.sleep(wait)
-            else:
-                log.error(
-                    "[translator] Page %s failed after %d attempts: %s — skipping.",
-                    page_path.name, _MAX_PAGE_RETRIES + 1, exc,
-                )
-
-    if page_succeeded:
-        id_to_hebrew = {t["id"]: t["hebrew_text"] for t in translations}
-        for region in page_data["regions"]:
-            if region["id"] in id_to_hebrew:
-                region["hebrew_text"] = id_to_hebrew[region["id"]]
-        json_path.write_text(
-            json.dumps(page_data, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
-
-        if glossary_updates:
-            async with glossary_lock:
-                glossary.update(glossary_updates)
-                _save_glossary(job_dir, glossary)
-
-        log.info(
-            "[translator] %s — translated %d region(s), %d new glossary term(s).",
-            page_path.name, len(translations), len(glossary_updates),
-        )
-
-    return page_tokens
-
-
-# ---------------------------------------------------------------------------
-# Per-page Gemini call
+# Region selection
 # ---------------------------------------------------------------------------
 
 def _get_translatable(regions: list[dict]) -> list[dict]:
@@ -528,18 +485,27 @@ def _get_translatable(regions: list[dict]) -> list[dict]:
 
 
 _MAX_RETRY_ATTEMPTS  = 5   # extra per-region retry attempts (blank/null hebrew_text)
-_MAX_PAGE_RETRIES    = 5   # retries when the ENTIRE page call fails (network/API error)
+_MAX_BATCH_RETRIES   = 5   # retries when the ENTIRE batch call fails (network/API error)
                            # waits: 10 s, 20 s, 40 s, 80 s, 120 s (exponential, capped)
 
 
-async def _translate_page(
-    regions:      list[dict],
+# ---------------------------------------------------------------------------
+# Batch Gemini call (may span multiple pages)
+# ---------------------------------------------------------------------------
+
+async def _translate_batch(
+    payload:      list[dict],
     glossary:     dict[str, str],
     user_api_key: str | None = None,
 ) -> tuple[list[dict], dict[str, str], dict[str, int]]:
     """
-    Send one page's regions to Gemini.
+    Send a batch of {id, source_text, type} regions — possibly spanning
+    multiple consecutive pages — to Gemini in a single request.
     Returns (translations, glossary_updates, token_counts).
+
+    *payload* ids must already be unique within the batch (the caller assigns
+    a fresh global id per region so per-page region ids that collide across
+    pages don't get conflated).
 
     The user message contains:
     • the current glossary (consistent name translations)
@@ -561,6 +527,7 @@ async def _translate_page(
         system_instruction=_SYSTEM_INSTRUCTION,
         temperature=_TEMPERATURE,
         response_mime_type="application/json",
+        max_output_tokens=_MAX_OUTPUT_TOKENS,
         # response_schema: TypedDict-based constrained decoding emits
         # additionalProperties:false which is only valid on Vertex AI /
         # Enterprise, not on the Developer API.  The combination of
@@ -603,15 +570,6 @@ async def _translate_page(
         return translations, glossary_updates, _extract_tokens(response)
 
     # ── Initial call ──────────────────────────────────────────────────────────
-    payload = [
-        {
-            "id":          r["id"],
-            "source_text": r["source_text"],
-            "type":        r.get("type", "dialogue"),
-        }
-        for r in regions
-    ]
-
     translations, glossary_updates, total_tokens = \
         await _call_gemini(payload, glossary)
 

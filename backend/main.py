@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -47,6 +48,11 @@ job_manager = JobManager()
 # True when the server itself is configured to use Modal (no per-user tokens needed).
 _SERVER_USES_MODAL = os.getenv("USE_MODAL", "false").lower() == "true"
 
+# Periodic janitor — sweeps data/jobs/ for abandoned/incomplete jobs while the
+# server stays up for long stretches (production: no restart-triggered scan).
+_JANITOR_INTERVAL_SECONDS = int(os.getenv("JANITOR_INTERVAL_SECONDS", str(3 * 60 * 60)))  # every 3 h
+_JANITOR_GRACE_SECONDS    = int(os.getenv("JANITOR_GRACE_SECONDS", str(60 * 60)))          # 60 min idle
+
 
 # ---------------------------------------------------------------------------
 # Startup: scan completed jobs and register any that are not yet in the library
@@ -55,25 +61,42 @@ _SERVER_USES_MODAL = os.getenv("USE_MODAL", "false").lower() == "true"
 @app.on_event("startup")
 async def _startup_scan_library() -> None:
     """
-    On every server start, walk data/jobs/ and register any job that:
-      • has a chapter_meta.json  (was a URL-based job with metadata)
-      • has output/result_compressed.pdf  (pipeline ran to completion)
-      • is NOT already in the library DB (checked by mangadex_id)
+    On every server start, walk data/jobs/ and:
 
-    This makes library registration resilient to server restarts that killed
-    the background task before it could commit.
+      1. Delete any job directory that never reached completion — i.e. has
+         neither output/result.pdf nor output/result_compressed.pdf. These
+         are jobs that were interrupted (server crash/restart mid-pipeline,
+         or a process that died before its own except-block cleanup ran) and
+         would otherwise sit on disk forever as orphaned data.
+
+      2. For completed jobs that have a chapter_meta.json (URL-based jobs
+         with library metadata) and are NOT already in the library DB
+         (checked by mangadex_id), register them.
+
+    Step 2 makes library registration resilient to server restarts that
+    killed the background task before it could commit.
     """
-    registered = skipped = failed = 0
+    registered = skipped = failed = deleted = 0
     r2_mode = library._r2_mode()
     for job_dir in sorted(JOBS_DIR.iterdir()):
         if not job_dir.is_dir():
             continue
-        meta_path = job_dir / "chapter_meta.json"
+
         # Accept either result.pdf or result_compressed.pdf as completion markers
         output_dir    = job_dir / "output"
         pdf_path      = output_dir / "result_compressed.pdf"
         pdf_path_full = output_dir / "result.pdf"
-        if not meta_path.exists() or (not pdf_path.exists() and not pdf_path_full.exists()):
+        if not pdf_path.exists() and not pdf_path_full.exists():
+            # Interrupted job — never produced a final output. Remove it so
+            # incomplete jobs don't accumulate on the server.
+            shutil.rmtree(job_dir, ignore_errors=True)
+            job_manager.remove_job(job_dir.name)
+            deleted += 1
+            continue
+
+        meta_path = job_dir / "chapter_meta.json"
+        if not meta_path.exists():
+            # Completed file-upload job (no library metadata) — keep as-is.
             continue
         try:
             meta = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -99,12 +122,94 @@ async def _startup_scan_library() -> None:
             )
             failed += 1
 
-    if registered or failed:
+    if registered or failed or deleted:
         import logging as _log
         _log.getLogger(__name__).info(
-            "[startup] Library scan: %d registered, %d skipped (already in DB), %d failed",
-            registered, skipped, failed,
+            "[startup] Library scan: %d registered, %d skipped (already in DB), "
+            "%d failed, %d incomplete job(s) deleted",
+            registered, skipped, failed, deleted,
         )
+
+
+# ---------------------------------------------------------------------------
+# Periodic janitor — for long-lived production servers that never restart
+# ---------------------------------------------------------------------------
+#
+# The startup scan above only runs once, when the process boots. On a
+# production deploy that stays up for days/weeks with many concurrent users,
+# a job can become permanently abandoned without ever raising an exception
+# (e.g. a Gemini/Modal call that hangs instead of erroring, a deadlocked
+# inpainting step, etc.) — in that case the per-job try/except cleanup in
+# _run_pipeline* never fires, and the directory would sit on disk forever.
+#
+# This loop wakes up every _JANITOR_INTERVAL_SECONDS (default 3 h) and
+# deletes any job directory that is:
+#   • incomplete         — no output/result.pdf or output/result_compressed.pdf
+#   • not active         — job_manager has no in-progress record for it, so a
+#                           job genuinely being worked on right now (by this
+#                           or any concurrent user) is NEVER touched
+#   • idle long enough   — nothing under the directory has been modified in
+#                           the last _JANITOR_GRACE_SECONDS (default 30 min),
+#                           so a job that just started is never mistaken for
+#                           abandoned
+
+async def _janitor_sweep() -> None:
+    """Delete abandoned/incomplete job directories. See module note above."""
+    deleted = 0
+    now = time.time()
+
+    for job_dir in sorted(JOBS_DIR.iterdir()):
+        if not job_dir.is_dir():
+            continue
+
+        output_dir    = job_dir / "output"
+        pdf_path      = output_dir / "result_compressed.pdf"
+        pdf_path_full = output_dir / "result.pdf"
+        if pdf_path.exists() or pdf_path_full.exists():
+            continue  # completed — keep
+
+        job_id = job_dir.name
+        if job_id in job_manager._history and not job_manager._done.get(job_id, False):
+            continue  # actively being processed right now — never touch
+
+        try:
+            newest = max(
+                (p.stat().st_mtime for p in job_dir.rglob("*")),
+                default=job_dir.stat().st_mtime,
+            )
+        except OSError:
+            continue  # directory vanished mid-scan or unreadable — skip safely
+
+        if now - newest < _JANITOR_GRACE_SECONDS:
+            continue  # still fresh — give it more time to finish or fail naturally
+
+        shutil.rmtree(job_dir, ignore_errors=True)
+        job_manager.remove_job(job_id)
+        deleted += 1
+
+    if deleted:
+        import logging as _log
+        _log.getLogger(__name__).info(
+            "[janitor] Removed %d abandoned/incomplete job director%s",
+            deleted, "y" if deleted == 1 else "ies",
+        )
+
+
+async def _janitor_loop() -> None:
+    """Run _janitor_sweep() forever, every _JANITOR_INTERVAL_SECONDS."""
+    while True:
+        await asyncio.sleep(_JANITOR_INTERVAL_SECONDS)
+        try:
+            await _janitor_sweep()
+        except Exception:
+            import logging as _log
+            _log.getLogger(__name__).exception("[janitor] Sweep failed")
+
+
+@app.on_event("startup")
+async def _start_janitor() -> None:
+    """Kick off the periodic janitor loop as a background task."""
+    asyncio.create_task(_janitor_loop())
 
 
 # ---------------------------------------------------------------------------
@@ -826,37 +931,83 @@ async def weebcentral_featured():
     Return the latest-updated series from WeebCentral for the discover page.
     Uses /search/data with adult=False so explicit content is excluded.
 
+    Ecchi/Mature-tagged series are excluded from these "suggested" results
+    (home page "Trending Now" row + discover page default grid) but will
+    still show up if the user searches for them directly via
+    /api/search/weebcentral.
+
+    To surface more Adventure content, we additionally fetch a second pool
+    filtered to included_tag=Adventure and interleave it with the general
+    "Latest Updates" pool (deduplicated, capped at 24 total).
+
     Returns: { results: [{ id, title, cover, url }] }
     """
     import httpx
 
-    wc_params: list[tuple[str, str]] = [
-        ("text",         ""),
-        ("sort",         "Latest Updates"),
-        ("order",        "Descending"),
-        ("official",     "Any"),
-        ("anime",        "Any"),
-        ("adult",        "Any"),
-        ("display_mode", "Full Display"),
-        ("author",       ""),
-        ("excluded_tag", "Harem"),
-        ("excluded_tag", "Hentai"),
-    ]
+    _EXCLUDED_TAGS = ["Harem", "Hentai", "Ecchi", "Mature", "Romance"]
+
+    def _wc_params(included_tag: str | None = None) -> list[tuple[str, str]]:
+        params: list[tuple[str, str]] = [
+            ("text",         ""),
+            ("sort",         "Latest Updates"),
+            ("order",        "Descending"),
+            ("official",     "Any"),
+            ("anime",        "Any"),
+            ("adult",        "Any"),
+            ("display_mode", "Full Display"),
+            ("author",       ""),
+        ]
+        if included_tag:
+            params.append(("included_tag", included_tag))
+        params.extend(("excluded_tag", t) for t in _EXCLUDED_TAGS)
+        return params
 
     async with httpx.AsyncClient(follow_redirects=True, timeout=12.0) as client:
         try:
-            res = await client.get(
-                "https://weebcentral.com/search/data",
-                params=wc_params,
-                headers={**_WC_HEADERS, "HX-Request": "true"},
+            general_res, adventure_res = await asyncio.gather(
+                client.get(
+                    "https://weebcentral.com/search/data",
+                    params=_wc_params(),
+                    headers={**_WC_HEADERS, "HX-Request": "true"},
+                ),
+                client.get(
+                    "https://weebcentral.com/search/data",
+                    params=_wc_params("Adventure"),
+                    headers={**_WC_HEADERS, "HX-Request": "true"},
+                ),
             )
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"WeebCentral unreachable: {exc}")
 
-    if not res.is_success:
+    if not general_res.is_success:
         raise HTTPException(status_code=502, detail="WeebCentral featured unavailable.")
 
-    return {"results": _parse_wc_series(res.text, limit=24)}
+    general   = _parse_wc_series(general_res.text, limit=24)
+    adventure = _parse_wc_series(adventure_res.text, limit=24) if adventure_res.is_success else []
+
+    # Interleave adventure[0], general[0], adventure[1], general[1], … so
+    # Adventure-tagged series are boosted without losing variety. Dedupe by
+    # series id and cap at 24.
+    merged: list[dict] = []
+    seen: set[str] = set()
+    ai = gi = 0
+    while len(merged) < 24 and (ai < len(adventure) or gi < len(general)):
+        if ai < len(adventure):
+            series = adventure[ai]
+            ai += 1
+            if series["id"] not in seen:
+                seen.add(series["id"])
+                merged.append(series)
+        if len(merged) >= 24:
+            break
+        if gi < len(general):
+            series = general[gi]
+            gi += 1
+            if series["id"] not in seen:
+                seen.add(series["id"])
+                merged.append(series)
+
+    return {"results": merged}
 
 
 @app.get("/api/weebcentral/series/{series_id}")
