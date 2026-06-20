@@ -271,8 +271,11 @@ def _detect_page(page_path: Path, detection_dir: Path) -> None:
     mask_raw, mask_refined, blk_list = detector(img_bgr)
 
     # ── Mask ────────────────────────────────────────────────────────────────
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_dilated = cv2.dilate(mask_refined, kernel, iterations=2)
+    # Larger dilation (7×7, 3 iterations) gives better coverage for small
+    # single-word regions that a 5×5/2-iter pass sometimes leaves partially
+    # exposed, causing residual English pixels under the Hebrew typesetting.
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_dilated = cv2.dilate(mask_refined, kernel, iterations=3)
 
     mask_path = detection_dir / f"{page_path.stem}_mask.png"
     cv2.imwrite(str(mask_path), mask_dilated)

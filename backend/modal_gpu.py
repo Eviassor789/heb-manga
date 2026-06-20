@@ -143,8 +143,10 @@ def detect_page(img_bytes: bytes) -> dict:
     # ── Run detector ──────────────────────────────────────────────────────────
     _mask_raw, mask_refined, blk_list = _detector_inst(img_bgr)
 
-    kernel       = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    mask_dilated = cv2.dilate(mask_refined, kernel, iterations=2)
+    # Larger dilation (7×7, 3 iterations) — matches detector.py, gives better
+    # mask coverage for small single-word regions.
+    kernel       = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    mask_dilated = cv2.dilate(mask_refined, kernel, iterations=3)
 
     # Encode mask → PNG bytes → base64 string (JSON-serialisable)
     _, mask_buf = cv2.imencode(".png", mask_dilated)

@@ -65,8 +65,8 @@ log = logging.getLogger(__name__)
 _BACKEND_DIR = Path(__file__).resolve().parent.parent
 _FONTS_DIR   = _BACKEND_DIR / "fonts"
 
-_MAX_FONT_SIZE = 32    # largest font size to try (pixels)
-_MIN_FONT_SIZE = 8     # never shrink below this
+_ABSOLUTE_MAX_FONT_SIZE = 200  # hard cap — per-balloon max derived from bbox height
+_MIN_FONT_SIZE = 8             # never shrink below this
 _LINE_SPACING  = 4     # extra vertical pixels between consecutive lines
 _PADDING       = 8     # pixels between text block and bbox edges
 
@@ -309,11 +309,17 @@ def _typeset_page(src_path: Path, json_path: Path, out_path: Path) -> None:
         rendered_bboxes: list[list[int]] = []
 
         for region in page_data.get("regions", []):
-            hebrew = (region.get("hebrew_text") or "").strip()
-            if not hebrew:
-                continue   # OCR or translation produced nothing
             if region.get("type") == "sfx":
                 continue   # SFX not typeset at MVP
+
+            hebrew = (region.get("hebrew_text") or "").strip()
+            if not hebrew:
+                # Translation failed or was skipped for this balloon — fall back
+                # to the original source text so the balloon is never left empty
+                # after inpainting erased the original English characters.
+                hebrew = (region.get("source_text") or "").strip()
+            if not hebrew:
+                continue   # No text at all (OCR also failed) — skip region
 
             bbox = region["bbox"]
             if any(_bbox_iou(bbox, rb) > 0.45 or _bbox_containment(bbox, rb) > 0.75
@@ -363,7 +369,11 @@ def _render_region(
     if avail_w < 4 or avail_h < 4:
         return
 
-    font, lines = _fit_text(hebrew, avail_w, avail_h)
+    # Scale max font up to the balloon height so short text in a large balloon
+    # (e.g. a full-page "AAHH!") fills the space instead of rendering tiny.
+    # _ABSOLUTE_MAX_FONT_SIZE prevents absurd sizes on extremely tall regions.
+    per_balloon_max = min(_ABSOLUTE_MAX_FONT_SIZE, max(avail_h, _MIN_FONT_SIZE))
+    font, lines = _fit_text(hebrew, avail_w, avail_h, max_size=per_balloon_max)
     if not lines:
         return
 
@@ -400,18 +410,22 @@ def _render_region(
 # ---------------------------------------------------------------------------
 
 def _fit_text(
-    text:      str,
-    max_width: int,
+    text:       str,
+    max_width:  int,
     max_height: int,
+    max_size:   int = _ABSOLUTE_MAX_FONT_SIZE,
 ) -> tuple[ImageFont.FreeTypeFont, list[str]]:
     """
     Return (font, bidi_lines) for the largest font size that fits.
 
-    Tries every integer size from _MAX_FONT_SIZE down to _MIN_FONT_SIZE.
+    Tries every integer size from max_size down to _MIN_FONT_SIZE.
+    max_size defaults to _ABSOLUTE_MAX_FONT_SIZE but callers pass a
+    per-balloon value (min(ABSOLUTE_MAX, avail_h)) so that short text in a
+    large balloon scales up to fill the available space.
     At _MIN_FONT_SIZE the text is returned regardless of height overflow
     (it will be clipped by the image boundary rather than silently dropped).
     """
-    for size in range(_MAX_FONT_SIZE, _MIN_FONT_SIZE - 1, -1):
+    for size in range(max(max_size, _MIN_FONT_SIZE), _MIN_FONT_SIZE - 1, -1):
         try:
             font = _load_font(size)
         except Exception:
@@ -435,7 +449,8 @@ def _fit_text(
                 )
             return font, lines
 
-    # Unreachable in practice, but satisfies type checker
+    # Unreachable in practice (loop always returns at _MIN_FONT_SIZE), but
+    # satisfies the type checker.
     font = _load_font(_MIN_FONT_SIZE)
     return font, _wrap_and_bidi(text, font, max_width)
 

@@ -203,34 +203,42 @@ export default function ReaderPage() {
     let cancelled = false
 
     ;(async () => {
-      // Step 1 — check our own library for an already-translated next chapter
+      // Fetch library chapters + source-platform chapters in parallel so we can
+      // compare and always navigate to the IMMEDIATE next sequential chapter —
+      // not just any translated chapter that might be many chapters ahead.
+      //
+      // Logic:
+      //   1. Find the immediate next chapter on the source platform (smallest
+      //      num > currentNum). That is the "true" next chapter.
+      //   2. Check whether that specific chapter already exists in our library.
+      //   3. If yes → "Continue Reading" (translated state).
+      //      If no  → "Translate Now" (untranslated state).
+      //      If source has no next chapter → "Caught up".
+      //
+      // This prevents the previous bug where finishing chapter 358 would jump
+      // to chapter 371 (next translated) and skip the "Translate 359" prompt.
+
+      let libChapters: Chapter[] = []
       try {
         const r = await fetch(`/api/library/manga/${chapter.manga_id}`)
         if (cancelled) return
-        const { chapters: libChapters } = r.ok
-          ? (await r.json() as { chapters: Chapter[] })
-          : { chapters: [] as Chapter[] }
-
-        const sorted = libChapters
-          .filter(c => c.id !== id && !isNaN(parseFloat(c.chapter_num ?? '')))
-          .sort((a, b) => parseFloat(a.chapter_num!) - parseFloat(b.chapter_num!))
-        const next = sorted.find(c => parseFloat(c.chapter_num!) > currentNum)
-
-        if (next) {
-          if (cancelled) return
-          setNextChapter(next)
-          setNextChapterLabel(`Chapter ${next.chapter_num}`)
-          setEndCardState('translated')
-          return
+        if (r.ok) {
+          const data = await r.json() as { chapters: Chapter[] }
+          libChapters = data.chapters ?? []
         }
-      } catch { /* fall through */ }
+      } catch { /* library unavailable — treat as empty */ }
 
       if (cancelled) return
 
-      // Step 2 — check the source platform for an untranslated next chapter
+      // Build a fast lookup: chapter_num string → library Chapter
+      const libByNum = new Map<string, Chapter>()
+      for (const c of libChapters) {
+        if (c.id !== id && c.chapter_num) libByNum.set(c.chapter_num, c)
+      }
+
       try {
         if (chapter.mangadex_id?.startsWith('wc:')) {
-          // WeebCentral
+          // ── WeebCentral ──────────────────────────────────────────────────
           const r = await fetch(`/api/weebcentral/series/${chapter.manga_id}/chapters`)
           if (cancelled) return
           if (!r.ok) throw new Error()
@@ -241,15 +249,25 @@ export default function ReaderPage() {
             .filter(c => !isNaN(parseFloat(c.number)))
             .sort((a, b) => parseFloat(a.number) - parseFloat(b.number))
           const wcNext = wcSorted.find(c => parseFloat(c.number) > currentNum)
-          if (wcNext) {
-            if (cancelled) return
-            setNextChapterUrl(wcNext.url)
-            setNextChapterLabel(`Chapter ${wcNext.number}`)
-            setEndCardState('untranslated')
+
+          if (!wcNext) {
+            if (!cancelled) setEndCardState('caught-up')
             return
           }
+          if (cancelled) return
+
+          setNextChapterLabel(`Chapter ${wcNext.number}`)
+          const inLib = libByNum.get(wcNext.number)
+          if (inLib) {
+            setNextChapter(inLib)
+            setEndCardState('translated')
+          } else {
+            setNextChapterUrl(wcNext.url)
+            setEndCardState('untranslated')
+          }
+
         } else {
-          // MangaDex — query the chapter feed for anything after currentNum
+          // ── MangaDex ────────────────────────────────────────────────────
           const params = new URLSearchParams({
             limit: '1',
             'order[chapter]': 'asc',
@@ -262,18 +280,28 @@ export default function ReaderPage() {
           if (cancelled) return
           if (!r.ok) throw new Error()
           const data = await r.json()
-          if (data.data?.length > 0) {
-            const mdNext   = data.data[0]
-            const mdNum    = mdNext.attributes?.chapter ?? ''
-            setNextChapterUrl(`https://mangadex.org/chapter/${mdNext.id}`)
-            setNextChapterLabel(`Chapter ${mdNum}`)
-            setEndCardState('untranslated')
+
+          if (!data.data?.length) {
+            if (!cancelled) setEndCardState('caught-up')
             return
           }
-        }
-      } catch { /* fall through to caught-up */ }
+          if (cancelled) return
 
-      if (!cancelled) setEndCardState('caught-up')
+          const mdNext = data.data[0]
+          const mdNum  = mdNext.attributes?.chapter ?? ''
+          setNextChapterLabel(`Chapter ${mdNum}`)
+          const inLib = libByNum.get(mdNum)
+          if (inLib) {
+            setNextChapter(inLib)
+            setEndCardState('translated')
+          } else {
+            setNextChapterUrl(`https://mangadex.org/chapter/${mdNext.id}`)
+            setEndCardState('untranslated')
+          }
+        }
+      } catch { /* source API unavailable */ }
+
+      if (!cancelled && !libChapters.length) setEndCardState('caught-up')
     })()
 
     return () => { cancelled = true }
@@ -666,7 +694,6 @@ export default function ReaderPage() {
                 src={pageUrl(pagesPrefix, n)}
                 alt={`Page ${n}`}
                 className="w-full block"
-                style={{ aspectRatio: '2/3' }}
                 loading={n <= 3 ? 'eager' : 'lazy'}
                 decoding="async"
                 onError={e => {
